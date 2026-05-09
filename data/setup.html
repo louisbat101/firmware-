@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32-C3 Batch Flow – Setup</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="app.js" defer></script>
+</head>
+<body>
+    <div class="wrap">
+        <header>
+            <div class="topbar">
+                <div>
+                    <h1>Batch Flow Setup</h1>
+                    <p class="muted">ESP32‑C3 hotspot web app • Flow inputs on GPIO 2 & 3</p>
+                </div>
+                <nav class="nav">
+                    <a class="navlink active" href="/setup.html">Setup</a>
+                    <a class="navlink" href="/run.html">Run</a>
+                </nav>
+            </div>
+        </header>
+
+        <section class="card">
+            <h2>Live Pulses</h2>
+            <div class="grid2">
+                <div class="stat">
+                    <div class="label">Sensor 1 (GPIO2)</div>
+                    <div class="value" id="p1">0</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Sensor 2 (GPIO3)</div>
+                    <div class="value" id="p2">0</div>
+                </div>
+            </div>
+            <div class="row">
+                <button id="resetPulses" class="btn">Reset counters</button>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>Calibration</h2>
+            <p class="muted">Set a global calibration (optional). Products can also have their own pulses/gal.</p>
+            <div class="row">
+                <label>
+                    Pulses per gallon
+                    <input id="calPpg" type="number" step="0.01" min="0" placeholder="e.g. 450.0" />
+                </label>
+                <button id="saveCal" class="btn primary">Save</button>
+            </div>
+            <div class="muted" id="calStatus"></div>
+        </section>
+
+        <section class="card">
+            <h2>Products</h2>
+            <div class="row3">
+                <label>
+                    Name
+                    <input id="prodName" type="text" placeholder="Product A" />
+                </label>
+                <label>
+                    Pulses/gal
+                    <input id="prodPpg" type="number" step="0.01" min="0" placeholder="450.0" />
+                </label>
+                <label>
+                    Valve close time (ms)
+                    <input id="prodClose" type="number" step="1" min="0" placeholder="150" />
+                </label>
+                <button id="addProd" class="btn primary">Add product</button>
+            </div>
+
+            <div id="products" class="list"></div>
+        </section>
+    </div>
+</body>
+</html>

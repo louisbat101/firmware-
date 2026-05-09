@@ -12,6 +12,11 @@ h1{margin:0 0 6px;font-size:20px}
 h2{margin:0 0 10px;font-size:16px}
 .muted{opacity:.8;font-size:12px}
 
+.topbar{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap}
+.nav{display:flex;gap:8px;align-items:center}
+.navlink{display:inline-block;padding:8px 10px;border-radius:10px;border:1px solid #2b3a66;background:#0b1220;color:#e6eefb;text-decoration:none;font-weight:700;font-size:12px;opacity:.9}
+.navlink.active{background:#1e3a8a;border-color:#2a4fc0;opacity:1}
+
 .card{
     background:#111b33;
     border:1px solid #26365f;

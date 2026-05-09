@@ -618,6 +618,8 @@ void setup() {
 
   // Static file serving from LittleFS (data/ uploaded to the device)
   server.serveStatic("/index.html", LittleFS, "/index.html");
+  server.serveStatic("/setup.html", LittleFS, "/setup.html");
+  server.serveStatic("/run.html", LittleFS, "/run.html");
   server.serveStatic("/app.js", LittleFS, "/app.js");
   server.serveStatic("/styles.css", LittleFS, "/styles.css");
 
