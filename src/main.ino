@@ -383,8 +383,14 @@ void setup() {
   // UART1 on ESP32-C3 can be mapped to arbitrary GPIOs.
   RS485.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
 
-  if (!LittleFS.begin()) {
-    Serial.println("LittleFS mount failed. Did you upload the data/ folder?");
+  // LittleFS mount. If it fails (e.g., fresh chip or corrupted FS), format and retry.
+  if (!LittleFS.begin(false)) {
+    Serial.println("LittleFS mount failed. Formatting...");
+    if (!LittleFS.begin(true)) {
+      Serial.println("LittleFS mount failed even after format.");
+    } else {
+      Serial.println("LittleFS formatted and mounted.");
+    }
   }
 
   loadConfig();
