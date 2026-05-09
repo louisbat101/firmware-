@@ -3,6 +3,9 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 
+// --- RS485 / Modbus RTU (proportional valve) ---
+#include <HardwareSerial.h>
+
 // This project runs as a Wi-Fi hotspot (AP mode). Connect your phone/laptop to this SSID.
 const char* apSsid = "ESP32C3-Keypad";
 const char* apPassword = "12345678"; // 8+ chars
@@ -16,8 +19,18 @@ static const int FLOW_PIN_1 = 2;
 static const int FLOW_PIN_2 = 3;
 
 // Valve control (set to a real pin when you wire it)
-static const int VALVE_PIN = -1; // -1 disables valve control
-static const bool VALVE_ACTIVE_HIGH = true;
+// This build uses a Modbus-RTU proportional valve over RS485.
+// Wiring (ESP32-C3): TX=GPIO4, RX=GPIO5, CN(DE/RE)=GPIO6
+static const int RS485_TX_PIN = 4;
+static const int RS485_RX_PIN = 5;
+static const int RS485_DE_PIN = 6; // CN pin controls TX enable (DE/RE)
+
+static const uint32_t RS485_BAUD = 9600; // datasheet: 9600 or 57600
+static const uint8_t MODBUS_ADDR = 0x01; // default device address
+
+// Valve positions are in degrees * 100: 0..9000 (0.00°..90.00°)
+static const int16_t VALVE_POS_OPEN = 0;     // 0° open
+static const int16_t VALVE_POS_CLOSED = 9000; // 90° closed
 
 static volatile uint32_t g_pulses1 = 0;
 static volatile uint32_t g_pulses2 = 0;
@@ -37,6 +50,10 @@ static uint32_t nowMs() { return (uint32_t)millis(); }
 struct Product;
 struct Config;
 static void valveWrite(bool open);
+static bool valveSetPositionDeg100(int16_t deg100);
+static bool valveReadPositionDeg100(int16_t* outDeg100);
+static bool valveClearError();
+static bool valveReadError(uint16_t* outErr);
 static void batchStopInternal();
 static float productPulsesPerGallon(const Product& p);
 
@@ -88,9 +105,186 @@ static uint32_t readValue(volatile uint32_t& v) {
 }
 
 static void valveWrite(bool open) {
-  if (VALVE_PIN < 0) return;
-  const bool level = VALVE_ACTIVE_HIGH ? open : !open;
-  digitalWrite(VALVE_PIN, level ? HIGH : LOW);
+  // Map the legacy open/close semantic to the proportional valve's position set.
+  // Note: This is synchronous and may take a few ms; acceptable for our state machine.
+  const int16_t target = open ? VALVE_POS_OPEN : VALVE_POS_CLOSED;
+  (void)valveSetPositionDeg100(target);
+}
+
+// ---------------------------
+// Modbus RTU helpers
+// ---------------------------
+
+static HardwareSerial RS485(1);
+
+static void rs485SetTx(bool enable) {
+  // Many RS485 modules use DE+RE tied together.
+  digitalWrite(RS485_DE_PIN, enable ? HIGH : LOW);
+  // Small settle time helps some transceivers
+  delayMicroseconds(50);
+}
+
+static uint16_t modbusCrc16(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; b++) {
+      if (crc & 1) {
+        crc = (crc >> 1) ^ 0xA001;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  return crc;
+}
+
+static void modbusDrainRx() {
+  while (RS485.available() > 0) (void)RS485.read();
+}
+
+static bool modbusSendAndRead(const uint8_t* req, size_t reqLen, uint8_t* resp, size_t respCap, size_t* outRespLen,
+                              uint32_t timeoutMs = 200) {
+  if (outRespLen) *outRespLen = 0;
+
+  modbusDrainRx();
+
+  rs485SetTx(true);
+  RS485.write(req, reqLen);
+  RS485.flush();
+  rs485SetTx(false);
+
+  const uint32_t start = millis();
+  size_t n = 0;
+  while ((millis() - start) < timeoutMs) {
+    while (RS485.available() > 0) {
+      const int c = RS485.read();
+      if (c < 0) break;
+      if (n < respCap) resp[n++] = (uint8_t)c;
+    }
+
+    // Heuristic: if we have at least address+func+crc and no new bytes for a bit, stop.
+    if (n >= 5) {
+      // quick idle wait to accumulate remaining bytes
+      delay(2);
+      if (RS485.available() == 0) break;
+    }
+    delay(1);
+  }
+
+  if (outRespLen) *outRespLen = n;
+  if (n < 5) return false;
+
+  const uint16_t gotCrc = (uint16_t)resp[n - 2] | ((uint16_t)resp[n - 1] << 8);
+  const uint16_t calcCrc = modbusCrc16(resp, n - 2);
+  if (gotCrc != calcCrc) return false;
+
+  return true;
+}
+
+static bool modbusReadHoldingRegisters(uint8_t addr, uint16_t startReg, uint16_t regCount, uint16_t* outRegs) {
+  if (regCount == 0 || regCount > 125) return false;
+
+  uint8_t req[8];
+  req[0] = addr;
+  req[1] = 0x03;
+  req[2] = (uint8_t)(startReg >> 8);
+  req[3] = (uint8_t)(startReg & 0xFF);
+  req[4] = (uint8_t)(regCount >> 8);
+  req[5] = (uint8_t)(regCount & 0xFF);
+  const uint16_t crc = modbusCrc16(req, 6);
+  req[6] = (uint8_t)(crc & 0xFF);
+  req[7] = (uint8_t)(crc >> 8);
+
+  uint8_t resp[256];
+  size_t n = 0;
+  if (!modbusSendAndRead(req, sizeof(req), resp, sizeof(resp), &n)) return false;
+
+  if (resp[0] != addr) return false;
+  if (resp[1] != 0x03) return false;
+  const uint8_t byteCount = resp[2];
+  if (byteCount != regCount * 2) return false;
+  if (n < (size_t)(3 + byteCount + 2)) return false;
+
+  for (uint16_t i = 0; i < regCount; i++) {
+    const uint8_t hi = resp[3 + i * 2];
+    const uint8_t lo = resp[3 + i * 2 + 1];
+    outRegs[i] = (uint16_t)hi << 8 | lo;
+  }
+  return true;
+}
+
+static bool modbusWriteMultipleRegisters(uint8_t addr, uint16_t startReg, uint16_t regCount, const uint16_t* regs) {
+  if (regCount == 0 || regCount > 123) return false;
+  const uint8_t byteCount = (uint8_t)(regCount * 2);
+  if (byteCount + 9 > 255) return false;
+
+  uint8_t req[255];
+  size_t idx = 0;
+  req[idx++] = addr;
+  req[idx++] = 0x10;
+  req[idx++] = (uint8_t)(startReg >> 8);
+  req[idx++] = (uint8_t)(startReg & 0xFF);
+  req[idx++] = (uint8_t)(regCount >> 8);
+  req[idx++] = (uint8_t)(regCount & 0xFF);
+  req[idx++] = byteCount;
+  for (uint16_t i = 0; i < regCount; i++) {
+    req[idx++] = (uint8_t)(regs[i] >> 8);
+    req[idx++] = (uint8_t)(regs[i] & 0xFF);
+  }
+  const uint16_t crc = modbusCrc16(req, idx);
+  req[idx++] = (uint8_t)(crc & 0xFF);
+  req[idx++] = (uint8_t)(crc >> 8);
+
+  uint8_t resp[16];
+  size_t n = 0;
+  if (!modbusSendAndRead(req, idx, resp, sizeof(resp), &n)) return false;
+
+  // Expected response: addr 0x10 startHi startLo countHi countLo crcLo crcHi
+  if (n < 8) return false;
+  if (resp[0] != addr) return false;
+  if (resp[1] != 0x10) return false;
+  const uint16_t rStart = (uint16_t)resp[2] << 8 | resp[3];
+  const uint16_t rCount = (uint16_t)resp[4] << 8 | resp[5];
+  if (rStart != startReg) return false;
+  if (rCount != regCount) return false;
+  return true;
+}
+
+// Register map from your doc
+static const uint16_t REG_DEVICE_ADDR = 0x0000;
+static const uint16_t REG_POSITION_SET = 0x0001;
+static const uint16_t REG_ERROR_STATE = 0x0002;
+static const uint16_t REG_POSITION_FEEDBACK = 0x0003;
+
+static bool valveSetPositionDeg100(int16_t deg100) {
+  // Clamp to device documented range (we only use 0..9000 normally)
+  if (deg100 < -10500) deg100 = -10500;
+  if (deg100 > 19500) deg100 = 19500;
+
+  const uint16_t v = (uint16_t)deg100; // keep two's complement bit pattern
+  return modbusWriteMultipleRegisters(MODBUS_ADDR, REG_POSITION_SET, 1, &v);
+}
+
+static bool valveReadPositionDeg100(int16_t* outDeg100) {
+  uint16_t r = 0;
+  const bool ok = modbusReadHoldingRegisters(MODBUS_ADDR, REG_POSITION_FEEDBACK, 1, &r);
+  if (!ok) return false;
+  if (outDeg100) *outDeg100 = (int16_t)r;
+  return true;
+}
+
+static bool valveReadError(uint16_t* outErr) {
+  uint16_t r = 0;
+  const bool ok = modbusReadHoldingRegisters(MODBUS_ADDR, REG_ERROR_STATE, 1, &r);
+  if (!ok) return false;
+  if (outErr) *outErr = r;
+  return true;
+}
+
+static bool valveClearError() {
+  const uint16_t zero = 0;
+  return modbusWriteMultipleRegisters(MODBUS_ADDR, REG_ERROR_STATE, 1, &zero);
 }
 
 static bool loadConfig() {
@@ -158,6 +352,12 @@ void setup() {
   Serial.println("Booting ESP32-C3 keypad AP...");
   WiFi.onEvent(onWiFiEvent);
 
+  // RS485 / Modbus setup
+  pinMode(RS485_DE_PIN, OUTPUT);
+  rs485SetTx(false); // receive mode
+  // UART1 on ESP32-C3 can be mapped to arbitrary GPIOs.
+  RS485.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+
   if (!LittleFS.begin()) {
     Serial.println("LittleFS mount failed. Did you upload the data/ folder?");
   }
@@ -168,11 +368,8 @@ void setup() {
   pinMode(FLOW_PIN_2, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(FLOW_PIN_1), isrFlow1, FALLING);
   attachInterrupt(digitalPinToInterrupt(FLOW_PIN_2), isrFlow2, FALLING);
-
-  if (VALVE_PIN >= 0) {
-    pinMode(VALVE_PIN, OUTPUT);
-    valveWrite(false);
-  }
+  // Ensure valve is commanded closed at boot (best-effort)
+  valveWrite(false);
 
   WiFi.disconnect(true);
   WiFi.persistent(false);
@@ -224,6 +421,16 @@ void setup() {
     doc["pulses2"] = readValue(g_pulses2);
     doc["calibrationPulsesPerGallon"] = g_cfg.calibrationPulsesPerGallon;
 
+    // Valve diagnostics (best-effort; if read fails we omit values)
+    int16_t pos = 0;
+    uint16_t err = 0;
+    if (valveReadPositionDeg100(&pos)) {
+      doc["valve"]["positionDeg100"] = (int)pos;
+    }
+    if (valveReadError(&err)) {
+      doc["valve"]["error"] = (uint32_t)err;
+    }
+
     const BatchState st = g_batchState;
     const uint32_t cur = readValue(g_pulses1);
     doc["batch"] ["state"] = (uint32_t)st;
@@ -239,14 +446,58 @@ void setup() {
     server.send(200, "application/json", body);
   });
 
+  // Valve API (optional diagnostics / manual control)
+  server.on("/api/valve/position", HTTP_GET, []() {
+    int16_t pos = 0;
+    if (!valveReadPositionDeg100(&pos)) {
+      sendText(500, "valve read failed");
+      return;
+    }
+    JsonDocument doc;
+    doc["positionDeg100"] = (int)pos;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+
+  server.on("/api/valve/error", HTTP_GET, []() {
+    uint16_t err = 0;
+    if (!valveReadError(&err)) {
+      sendText(500, "valve read failed");
+      return;
+    }
+    JsonDocument doc;
+    doc["error"] = (uint32_t)err;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+
+  server.on("/api/valve/error/clear", HTTP_POST, []() {
+    if (!valveClearError()) {
+      sendText(500, "valve clear failed");
+      return;
+    }
+    server.send(204, "text/plain", "");
+  });
+
+  // Set valve position (deg*100) e.g. 0=open, 9000=closed
+  server.on("/api/valve/set", HTTP_POST, []() {
+    if (!server.hasArg("deg100")) {
+      sendText(400, "missing deg100");
+      return;
+    }
+    const int deg100 = server.arg("deg100").toInt();
+    if (!valveSetPositionDeg100((int16_t)deg100)) {
+      sendText(500, "valve write failed");
+      return;
+    }
+    server.send(204, "text/plain", "");
+  });
   // Start a batch: productId + gallons. Uses sensor1 pulses.
   server.on("/api/batch/start", HTTP_POST, []() {
     if (!server.hasArg("productId") || !server.hasArg("gallons")) {
       sendText(400, "missing productId/gallons");
-      return;
-    }
-    if (VALVE_PIN < 0) {
-      sendText(400, "valve not configured (VALVE_PIN=-1)");
       return;
     }
     if (g_batchState != BatchState::Idle) {
