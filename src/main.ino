@@ -337,8 +337,28 @@ static bool saveConfig() {
     return false;
   }
   const size_t n = serializeJson(doc, f);
+  f.flush();
   f.close();
   if (n == 0) Serial.println("Config: serializeJson wrote 0 bytes");
+
+  // Verify write by checking size and attempting to parse back.
+  File rf = LittleFS.open(CONFIG_PATH, "r");
+  if (!rf) {
+    Serial.println("Config: verify failed to reopen /config.json");
+    return false;
+  }
+  const size_t size = (size_t)rf.size();
+  JsonDocument check;
+  const DeserializationError err = deserializeJson(check, rf);
+  rf.close();
+  if (err) {
+    Serial.printf("Config: verify parse error: %s\n", err.c_str());
+    return false;
+  }
+  if (size == 0) {
+    Serial.println("Config: verify size is 0");
+    return false;
+  }
   return n > 0;
 }
 
@@ -613,6 +633,32 @@ void setup() {
     g_cfg.productCount--;
     const bool ok = saveConfig();
     server.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+  });
+
+  // Config debug helpers
+  server.on("/api/config/get", HTTP_GET, []() {
+    if (!LittleFS.exists(CONFIG_PATH)) {
+      sendText(404, "config not found");
+      return;
+    }
+    File f = LittleFS.open(CONFIG_PATH, "r");
+    if (!f) {
+      sendText(500, "config open failed");
+      return;
+    }
+    server.streamFile(f, "application/json");
+    f.close();
+  });
+
+  server.on("/api/config/erase", HTTP_POST, []() {
+    if (LittleFS.exists(CONFIG_PATH)) {
+      if (!LittleFS.remove(CONFIG_PATH)) {
+        sendText(500, "config remove failed");
+        return;
+      }
+    }
+    g_cfg = Config();
+    server.send(200, "application/json", "{\"ok\":true}");
   });
 
   // Useful for debugging from browser
