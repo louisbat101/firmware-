@@ -40,8 +40,14 @@ function renderProducts(list) {
             <button class="btn danger" data-id="${p.id}">Delete</button>
         `;
         row.querySelector('button').addEventListener('click', async () => {
-            await api('/api/products/delete', { method: 'POST', params: { id: p.id } });
-            await refreshProducts();
+            const ps = has('prodStatus') ? el('prodStatus') : null;
+            if (ps) ps.textContent = '';
+            try {
+                await api('/api/products/delete', { method: 'POST', params: { id: p.id } });
+                await refreshProducts();
+            } catch (e) {
+                if (ps) ps.textContent = `Error: ${e.message}`;
+            }
         });
         root.appendChild(row);
     }
@@ -145,22 +151,36 @@ window.addEventListener('DOMContentLoaded', async () => {
             const pulsesPerGallon = parseFloat(el('prodPpg').value || '0');
             const valveCloseTimeMs = parseInt(el('prodClose').value || '0', 10);
             if (!name) return;
-            await api('/api/products', {
-                method: 'POST',
-                params: {
-                    name,
-                    pulsesPerGallon: String(pulsesPerGallon),
-                    valveCloseTimeMs: String(valveCloseTimeMs),
-                },
-            });
-            el('prodName').value = '';
-            await refreshProducts();
+            const ps = has('prodStatus') ? el('prodStatus') : null;
+            if (ps) ps.textContent = '';
+            try {
+                await api('/api/products', {
+                    method: 'POST',
+                    params: {
+                        name,
+                        pulsesPerGallon: String(pulsesPerGallon),
+                        valveCloseTimeMs: String(valveCloseTimeMs),
+                    },
+                });
+                el('prodName').value = '';
+                await refreshProducts();
+                if (ps) ps.textContent = 'Saved.';
+            } catch (e) {
+                if (ps) ps.textContent = `Error: ${e.message}`;
+            }
         });
     }
 
     if (has('refreshProducts')) {
         el('refreshProducts').addEventListener('click', async () => {
-            await refreshProducts();
+            const ps = has('prodStatus') ? el('prodStatus') : null;
+            if (ps) ps.textContent = '';
+            try {
+                await refreshProducts();
+                if (ps) ps.textContent = 'Loaded.';
+            } catch (e) {
+                if (ps) ps.textContent = `Error: ${e.message}`;
+            }
         });
     }
 

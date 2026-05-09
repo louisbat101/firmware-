@@ -12,6 +12,15 @@ const char* apPassword = "12345678"; // 8+ chars
 
 WebServer server(80);
 
+static bool g_fsMounted = false;
+
+static bool ensureFS() {
+  if (g_fsMounted) return true;
+  // Try to (re)mount without formatting during runtime.
+  g_fsMounted = LittleFS.begin(false);
+  return g_fsMounted;
+}
+
 static volatile char g_lastKey = 0;
 
 // Flow inputs (hall sensors)
@@ -384,9 +393,11 @@ void setup() {
   RS485.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
 
   // LittleFS mount. If it fails (e.g., fresh chip or corrupted FS), format and retry.
-  if (!LittleFS.begin(false)) {
+  g_fsMounted = LittleFS.begin(false);
+  if (!g_fsMounted) {
     Serial.println("LittleFS mount failed. Formatting...");
-    if (!LittleFS.begin(true)) {
+    g_fsMounted = LittleFS.begin(true);
+    if (!g_fsMounted) {
       Serial.println("LittleFS mount failed even after format.");
     } else {
       Serial.println("LittleFS formatted and mounted.");
@@ -574,6 +585,10 @@ void setup() {
 
   // Calibration: set global pulses/gal
   server.on("/api/calibration", HTTP_POST, []() {
+    if (!ensureFS()) {
+      sendText(500, "filesystem not mounted");
+      return;
+    }
     if (!server.hasArg("pulsesPerGallon")) {
       sendText(400, "missing pulsesPerGallon");
       return;
@@ -592,6 +607,10 @@ void setup() {
 
   // Products CRUD (simple)
   server.on("/api/products", HTTP_GET, []() {
+    if (!ensureFS()) {
+      sendText(500, "filesystem not mounted");
+      return;
+    }
     JsonDocument doc;
     JsonArray arr = doc["products"].to<JsonArray>();
     for (size_t i = 0; i < g_cfg.productCount; i++) {
@@ -607,6 +626,10 @@ void setup() {
   });
 
   server.on("/api/products", HTTP_POST, []() {
+    if (!ensureFS()) {
+      sendText(500, "filesystem not mounted");
+      return;
+    }
     if (!server.hasArg("name") || !server.hasArg("pulsesPerGallon") || !server.hasArg("valveCloseTimeMs")) {
       sendText(400, "missing fields");
       return;
@@ -624,6 +647,10 @@ void setup() {
   });
 
   server.on("/api/products/delete", HTTP_POST, []() {
+    if (!ensureFS()) {
+      sendText(500, "filesystem not mounted");
+      return;
+    }
     if (!server.hasArg("id")) {
       sendText(400, "missing id");
       return;
@@ -643,6 +670,10 @@ void setup() {
 
   // Config debug helpers
   server.on("/api/config/get", HTTP_GET, []() {
+    if (!ensureFS()) {
+      sendText(500, "filesystem not mounted");
+      return;
+    }
     if (!LittleFS.exists(CONFIG_PATH)) {
       sendText(404, "config not found");
       return;
@@ -657,6 +688,10 @@ void setup() {
   });
 
   server.on("/api/config/erase", HTTP_POST, []() {
+    if (!ensureFS()) {
+      sendText(500, "filesystem not mounted");
+      return;
+    }
     if (LittleFS.exists(CONFIG_PATH)) {
       if (!LittleFS.remove(CONFIG_PATH)) {
         sendText(500, "config remove failed");
