@@ -1,6 +1,6 @@
-# Arduino Web Keypad
+# ESP32-C3 AP Hotspot Web Keypad
 
-This project implements an on-screen keypad using an Arduino board, allowing users to interact with the keypad through a web interface.
+This project runs an **ESP32‑C3** as a **Wi‑Fi hotspot (Access Point)** and serves an on‑screen keypad web app from **LittleFS**.
 
 ## Project Structure
 
@@ -22,31 +22,34 @@ arduino-web-keypad
    - USB cable for connecting the Arduino to your computer.
 
 2. **Software Requirements:**
-   - Arduino IDE installed on your computer.
-   - Required libraries for Wi-Fi and web server functionality (e.g., ESP8266WiFi, ESPAsyncWebServer).
+   - PlatformIO (VS Code extension) **or** Arduino IDE
 
 3. **Installation Steps:**
    - Clone or download the repository to your local machine.
-   - Open `src/main.ino` and set your Wi-Fi credentials (`ssid` / `password`).
    - **Important:** this project serves `/index.html`, `/app.js`, and `/styles.css` from **LittleFS**.
      You must upload the `data/` folder to the board at least once.
 
 ### PlatformIO (recommended)
 
-This repo includes `platformio.ini` for ESP32-C3.
+This repo includes `platformio.ini` for ESP32‑C3.
 
-1. Build + upload firmware
-2. Upload filesystem image (uploads `data/` to LittleFS)
-3. Open serial monitor to get the IP address
+```bash
+pio run
+pio run -t upload
+pio run -t uploadfs
+pio device monitor -b 115200
+```
 
 ### Arduino IDE
 
 If you use Arduino IDE, you’ll need an ESP32 LittleFS uploader plugin/tooling and then upload the `data/` folder.
 
-4. **Accessing the Keypad:**
-   - Once the Arduino is connected to Wi-Fi, open a web browser.
-   - Enter the IP address assigned to your Arduino (check the Serial Monitor for the IP).
-   - You should see the on-screen keypad displayed in your browser.
+4. **Accessing the Keypad (AP / Hotspot mode):**
+    - Connect your phone/laptop to the ESP’s Wi‑Fi network:
+       - SSID: `ESP32C3-Keypad`
+       - Password: `12345678`
+    - Open the keypad UI in your browser:
+       - `http://192.168.4.1/`
 
 ## Usage
 
