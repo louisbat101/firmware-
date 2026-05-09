@@ -43,6 +43,18 @@ function renderProducts(list) {
     }
 }
 
+function renderRunProducts(list) {
+    const sel = el('runProduct');
+    if (!sel) return;
+    sel.innerHTML = '';
+    for (const p of list) {
+        const opt = document.createElement('option');
+        opt.value = String(p.id);
+        opt.textContent = p.name;
+        sel.appendChild(opt);
+    }
+}
+
 function escapeHtml(s) {
     return String(s)
         .replaceAll('&', '&amp;')
@@ -59,11 +71,27 @@ async function refreshStatus() {
     if (typeof st.calibrationPulsesPerGallon === 'number') {
         el('calPpg').value = st.calibrationPulsesPerGallon || '';
     }
+
+    const bs = st.batch || {};
+    const rs = el('runStatus');
+    if (rs) {
+      const state = Number(bs.state ?? 0);
+      const names = ['IDLE', 'RUNNING', 'CLOSING_DELAY', 'DONE', 'ERROR'];
+      const label = names[state] || `STATE_${state}`;
+      const cur = Number(bs.currentPulses ?? 0);
+      const start = Number(bs.startPulses ?? 0);
+      const target = Number(bs.targetPulses ?? 0);
+      const delta = Math.max(0, cur - start);
+      rs.textContent = target > 0
+        ? `Batch: ${label} • ${delta}/${target} pulses`
+        : `Batch: ${label}`;
+    }
 }
 
 async function refreshProducts() {
     const data = await api('/api/products');
     renderProducts(data.products || []);
+    renderRunProducts(data.products || []);
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
@@ -99,6 +127,24 @@ window.addEventListener('DOMContentLoaded', async () => {
         el('prodName').value = '';
         await refreshProducts();
     });
+
+        const runStart = el('runStart');
+        const runStop = el('runStop');
+        if (runStart && runStop) {
+            runStart.addEventListener('click', async () => {
+                const productId = el('runProduct').value;
+                const gallons = parseFloat(el('runGallons').value || '0');
+                if (!(gallons > 0)) return;
+                try {
+                    await api('/api/batch/start', { method: 'POST', params: { productId, gallons: String(gallons) } });
+                } catch (e) {
+                    el('runStatus').textContent = `Error: ${e.message}`;
+                }
+            });
+            runStop.addEventListener('click', async () => {
+                await api('/api/batch/stop', { method: 'POST' });
+            });
+        }
 
     await refreshProducts();
     await refreshStatus();

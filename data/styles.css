@@ -34,6 +34,14 @@ input{
     color:#e6eefb;
 }
 
+select{
+    padding:10px 12px;
+    border-radius:10px;
+    border:1px solid #26365f;
+    background:#0b1220;
+    color:#e6eefb;
+}
+
 .row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
 .row3{display:grid;grid-template-columns:1.3fr 1fr 1fr auto;gap:10px;align-items:end}
 

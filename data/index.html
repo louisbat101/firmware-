@@ -64,6 +64,24 @@
 
             <div id="products" class="list"></div>
         </section>
+
+        <section class="card">
+            <h2>Batch Run</h2>
+            <p class="muted">Uses Sensor 1 (GPIO2) pulses. Valve control requires setting a real `VALVE_PIN` in firmware.</p>
+            <div class="row">
+                <label>
+                    Product
+                    <select id="runProduct"></select>
+                </label>
+                <label>
+                    Gallons
+                    <input id="runGallons" type="number" step="0.01" min="0" placeholder="1.00" />
+                </label>
+                <button id="runStart" class="btn primary">Start</button>
+                <button id="runStop" class="btn danger">Stop</button>
+            </div>
+            <div class="muted" id="runStatus"></div>
+        </section>
     </div>
 </body>
 </html>

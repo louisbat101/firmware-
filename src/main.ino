@@ -22,6 +22,24 @@ static const bool VALVE_ACTIVE_HIGH = true;
 static volatile uint32_t g_pulses1 = 0;
 static volatile uint32_t g_pulses2 = 0;
 
+// Batch run state (uses Sensor1 pulses by default)
+enum class BatchState : uint8_t { Idle, Running, ClosingDelay, Done, Error };
+static volatile BatchState g_batchState = BatchState::Idle;
+static volatile uint32_t g_batchTargetPulses = 0;
+static volatile uint32_t g_batchStartPulses = 0;
+static volatile uint32_t g_batchStopAtMs = 0;
+static volatile uint32_t g_batchClosedAtMs = 0;
+static volatile int g_batchProductId = -1;
+
+static uint32_t nowMs() { return (uint32_t)millis(); }
+
+// Forward declarations (Arduino's auto-prototypes can get the order wrong)
+struct Product;
+struct Config;
+static void valveWrite(bool open);
+static void batchStopInternal();
+static float productPulsesPerGallon(const Product& p);
+
 // Config persisted in LittleFS
 static const char* CONFIG_PATH = "/config.json";
 
@@ -38,6 +56,18 @@ struct Config {
 };
 
 Config g_cfg;
+
+static void batchStopInternal() {
+  valveWrite(false);
+  g_batchState = BatchState::Idle;
+  g_batchTargetPulses = 0;
+  g_batchProductId = -1;
+}
+
+static float productPulsesPerGallon(const Product& p) {
+  if (p.pulsesPerGallon > 0.0f) return p.pulsesPerGallon;
+  return g_cfg.calibrationPulsesPerGallon;
+}
 
 static IRAM_ATTR void isrFlow1() { g_pulses1++; }
 static IRAM_ATTR void isrFlow2() { g_pulses2++; }
@@ -193,9 +223,71 @@ void setup() {
     doc["pulses1"] = readValue(g_pulses1);
     doc["pulses2"] = readValue(g_pulses2);
     doc["calibrationPulsesPerGallon"] = g_cfg.calibrationPulsesPerGallon;
+
+    const BatchState st = g_batchState;
+    const uint32_t cur = readValue(g_pulses1);
+    doc["batch"] ["state"] = (uint32_t)st;
+    doc["batch"] ["productId"] = (int)g_batchProductId;
+    doc["batch"] ["targetPulses"] = (uint32_t)g_batchTargetPulses;
+    doc["batch"] ["startPulses"] = (uint32_t)g_batchStartPulses;
+    doc["batch"] ["currentPulses"] = (uint32_t)cur;
+    doc["batch"] ["stopAtMs"] = (uint32_t)g_batchStopAtMs;
+    doc["batch"] ["closedAtMs"] = (uint32_t)g_batchClosedAtMs;
+
     String body;
     serializeJson(doc, body);
     server.send(200, "application/json", body);
+  });
+
+  // Start a batch: productId + gallons. Uses sensor1 pulses.
+  server.on("/api/batch/start", HTTP_POST, []() {
+    if (!server.hasArg("productId") || !server.hasArg("gallons")) {
+      sendText(400, "missing productId/gallons");
+      return;
+    }
+    if (VALVE_PIN < 0) {
+      sendText(400, "valve not configured (VALVE_PIN=-1)");
+      return;
+    }
+    if (g_batchState != BatchState::Idle) {
+      sendText(409, "batch already running");
+      return;
+    }
+
+    const int pid = server.arg("productId").toInt();
+    if (pid < 0 || (size_t)pid >= g_cfg.productCount) {
+      sendText(400, "invalid productId");
+      return;
+    }
+    const float gallons = server.arg("gallons").toFloat();
+    if (!(gallons > 0.0f)) {
+      sendText(400, "invalid gallons");
+      return;
+    }
+
+    const Product& p = g_cfg.products[(size_t)pid];
+    const float ppg = productPulsesPerGallon(p);
+    if (!(ppg > 0.0f)) {
+      sendText(400, "missing pulsesPerGallon (set product or calibration)");
+      return;
+    }
+
+    const uint32_t target = (uint32_t)(gallons * ppg);
+    g_batchProductId = pid;
+    g_batchTargetPulses = target;
+    g_batchStartPulses = readValue(g_pulses1);
+    g_batchStopAtMs = 0;
+    g_batchClosedAtMs = 0;
+
+    valveWrite(true);
+    g_batchState = BatchState::Running;
+
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/api/batch/stop", HTTP_POST, []() {
+    batchStopInternal();
+    server.send(200, "application/json", "{\"ok\":true}");
   });
 
   // Calibration: set global pulses/gal
@@ -301,4 +393,40 @@ void setup() {
 
 void loop() {
   server.handleClient();
+
+  // Batch state machine
+  const BatchState st = g_batchState;
+  if (st == BatchState::Running) {
+    const uint32_t cur = readValue(g_pulses1);
+    const uint32_t delta = cur - g_batchStartPulses;
+    if (delta >= g_batchTargetPulses) {
+      valveWrite(false);
+      g_batchStopAtMs = nowMs();
+
+      // close-time compensation (remain in closing delay for valveCloseTimeMs)
+      const int pid = g_batchProductId;
+      uint32_t closeMs = 0;
+      if (pid >= 0 && (size_t)pid < g_cfg.productCount) {
+        closeMs = g_cfg.products[(size_t)pid].valveCloseTimeMs;
+      }
+      if (closeMs > 0) {
+        g_batchClosedAtMs = g_batchStopAtMs + closeMs;
+        g_batchState = BatchState::ClosingDelay;
+      } else {
+        g_batchState = BatchState::Done;
+      }
+    }
+  } else if (st == BatchState::ClosingDelay) {
+    if ((int32_t)(nowMs() - g_batchClosedAtMs) >= 0) {
+      g_batchState = BatchState::Done;
+    }
+  } else if (st == BatchState::Done) {
+    // Auto-return to idle after a short moment so UI can show DONE
+    static uint32_t doneSince = 0;
+    if (doneSince == 0) doneSince = nowMs();
+    if ((int32_t)(nowMs() - doneSince) > 2000) {
+      doneSince = 0;
+      batchStopInternal();
+    }
+  }
 }
