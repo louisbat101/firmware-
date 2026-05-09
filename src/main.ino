@@ -12,6 +12,9 @@ const char* apPassword = "12345678"; // 8+ chars
 
 WebServer server(80);
 
+// Bump this when you change anything in data/ (HTML/CSS/JS)
+static const char* UI_VERSION = "2026-05-09-2";
+
 static bool g_fsMounted = false;
 
 static bool ensureFS() {
@@ -65,6 +68,7 @@ static bool valveClearError();
 static bool valveReadError(uint16_t* outErr);
 static void batchStopInternal();
 static float productPulsesPerGallon(const Product& p);
+static bool modbusPingAddress(uint8_t addr);
 
 // Config persisted in LittleFS
 static const char* CONFIG_PATH = "/config.json";
@@ -223,6 +227,12 @@ static bool modbusReadHoldingRegisters(uint8_t addr, uint16_t startReg, uint16_t
   return true;
 }
 
+static bool modbusPingAddress(uint8_t addr) {
+  // Try a very small read; most devices either respond or time out.
+  uint16_t r = 0;
+  return modbusReadHoldingRegisters(addr, 0x0000, 1, &r);
+}
+
 static bool modbusWriteMultipleRegisters(uint8_t addr, uint16_t startReg, uint16_t regCount, const uint16_t* regs) {
   if (regCount == 0 || regCount > 123) return false;
   const uint8_t byteCount = (uint8_t)(regCount * 2);
@@ -375,6 +385,17 @@ static void sendText(int code, const char* text) {
   server.send(code, "text/plain", text);
 }
 
+static void sendNoCacheHeaders() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+}
+
+static void sendShortCacheHeaders() {
+  // Improves perceived speed when switching pages: allow caching for a bit.
+  server.sendHeader("Cache-Control", "public, max-age=300");
+}
+
 static void onWiFiEvent(WiFiEvent_t event) {
   Serial.printf("[WiFi event] %d\n", (int)event);
 }
@@ -483,6 +504,18 @@ void setup() {
     doc["batch"] ["stopAtMs"] = (uint32_t)g_batchStopAtMs;
     doc["batch"] ["closedAtMs"] = (uint32_t)g_batchClosedAtMs;
 
+    // products (so the Run page can compute remaining gallons without a second request)
+    {
+      JsonArray arr = doc["products"].to<JsonArray>();
+      for (size_t i = 0; i < g_cfg.productCount; i++) {
+        JsonObject p = arr.add<JsonObject>();
+        p["id"] = (uint32_t)i;
+        p["name"] = g_cfg.products[i].name;
+        p["pulsesPerGallon"] = g_cfg.products[i].pulsesPerGallon;
+        p["valveCloseTimeMs"] = g_cfg.products[i].valveCloseTimeMs;
+      }
+    }
+
     String body;
     serializeJson(doc, body);
     server.send(200, "application/json", body);
@@ -535,6 +568,44 @@ void setup() {
       return;
     }
     server.send(204, "text/plain", "");
+  });
+
+  // RS485 / Modbus diagnostics
+  // Scans a small range of Modbus addresses to see who responds.
+  server.on("/api/rs485/scan", HTTP_GET, []() {
+    // Optional query params: start=1 end=10
+    int start = 1;
+    int end = 10;
+    if (server.hasArg("start")) start = server.arg("start").toInt();
+    if (server.hasArg("end")) end = server.arg("end").toInt();
+    if (start < 1) start = 1;
+    if (end > 247) end = 247;
+    if (end < start) end = start;
+    // Keep it bounded so we don't block the UI for too long
+    if ((end - start) > 31) end = start + 31;
+
+    JsonDocument doc;
+    doc["baud"] = (uint32_t)RS485_BAUD;
+    doc["txPin"] = (int)RS485_TX_PIN;
+    doc["rxPin"] = (int)RS485_RX_PIN;
+    doc["dePin"] = (int)RS485_DE_PIN;
+    doc["defaultAddr"] = (uint32_t)MODBUS_ADDR;
+
+    JsonArray found = doc["found"].to<JsonArray>();
+    uint32_t okCount = 0;
+    for (int addr = start; addr <= end; addr++) {
+      if (modbusPingAddress((uint8_t)addr)) {
+        found.add((uint32_t)addr);
+        okCount++;
+      }
+      delay(10);
+      yield();
+    }
+    doc["okCount"] = okCount;
+
+    String body;
+    serializeJson(doc, body);
+    server.send(200, "application/json", body);
   });
   // Start a batch: productId + gallons. Uses sensor1 pulses.
   server.on("/api/batch/start", HTTP_POST, []() {
@@ -708,16 +779,47 @@ void setup() {
     server.send(200, "application/json", body);
   });
 
+  server.on("/api/version", HTTP_GET, []() {
+    sendNoCacheHeaders();
+    String body = String("{\"uiVersion\":\"") + UI_VERSION + "\"}";
+    server.send(200, "application/json", body);
+  });
+
   // Static file serving from LittleFS (data/ uploaded to the device)
-  server.serveStatic("/index.html", LittleFS, "/index.html");
-  server.serveStatic("/setup.html", LittleFS, "/setup.html");
-  server.serveStatic("/run.html", LittleFS, "/run.html");
-  server.serveStatic("/app.js", LittleFS, "/app.js");
-  server.serveStatic("/styles.css", LittleFS, "/styles.css");
+  // Some WebServer builds don't support cache control on serveStatic, so we stream
+  // these assets manually with no-cache headers.
+  auto streamAsset = [&](const char* uri, const char* path, const char* contentType, bool noCache) {
+    server.on(uri, HTTP_GET, [=]() {
+      if (!ensureFS()) {
+        sendText(500, "filesystem not mounted");
+        return;
+      }
+      if (!LittleFS.exists(path)) {
+        sendText(404, "not found");
+        return;
+      }
+      File f = LittleFS.open(path, "r");
+      if (noCache) sendNoCacheHeaders();
+      else sendShortCacheHeaders();
+      server.streamFile(f, contentType);
+      f.close();
+    });
+  };
+
+  streamAsset("/index.html", "/index.html", "text/html", true);
+  streamAsset("/setup.html", "/setup.html", "text/html", true);
+  streamAsset("/run.html", "/run.html", "text/html", true);
+  streamAsset("/diagnostics.html", "/diagnostics.html", "text/html", true);
+  streamAsset("/app.js", "/app.js", "application/javascript", false);
+  streamAsset("/styles.css", "/styles.css", "text/css", false);
 
   // Fallback: try to serve the requested path from filesystem
   server.onNotFound([]() {
-    const String path = server.uri();
+    String path = server.uri();
+    // tolerate cache-busting querystrings like /app.js?v=...
+    const int q = path.indexOf('?');
+    if (q >= 0) path = path.substring(0, q);
+
     if (LittleFS.exists(path)) {
       String contentType = "text/plain";
       if (path.endsWith(".html")) contentType = "text/html";
@@ -726,6 +828,8 @@ void setup() {
       else if (path.endsWith(".json")) contentType = "application/json";
 
       File f = LittleFS.open(path, "r");
+      if (path.endsWith(".html")) sendNoCacheHeaders();
+      else sendShortCacheHeaders();
       server.streamFile(f, contentType);
       f.close();
       return;

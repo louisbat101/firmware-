@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32-C3 Batch Flow – Diagnostics</title>
+    <link rel="stylesheet" href="styles.css?v=2026-05-09-2">
+    <script src="app.js?v=2026-05-09-2" defer></script>
+</head>
+<body>
+    <div class="wrap">
+        <header>
+            <div class="topbar">
+                <div>
+                    <h1>Diagnostics</h1>
+                    <p class="muted">RS485 / Modbus scan + quick health checks</p>
+                </div>
+                <nav class="nav">
+                    <a class="navlink" href="/setup.html">Setup</a>
+                    <a class="navlink" href="/run.html">Run</a>
+                    <a class="navlink active" href="/diagnostics.html">Diagnostics</a>
+                </nav>
+            </div>
+        </header>
+
+        <section class="card">
+            <h2>RS485 scan</h2>
+            <p class="muted">This sends a small Modbus read to each address in the range. Devices that respond will appear below.</p>
+            <div class="row">
+                <label>
+                    Start address
+                    <input id="rsStart" type="number" min="1" max="247" value="1" />
+                </label>
+                <label>
+                    End address
+                    <input id="rsEnd" type="number" min="1" max="247" value="10" />
+                </label>
+                <button id="rsScan" class="btn primary">Scan</button>
+            </div>
+            <div class="muted" id="rsStatus"></div>
+            <div id="rsFound" class="list"></div>
+        </section>
+
+        <section class="card">
+            <h2>Valve quick check</h2>
+            <p class="muted">Reads valve position + error using the configured Modbus address.</p>
+            <div class="row">
+                <button id="diagValveRead" class="btn">Read valve status</button>
+            </div>
+            <div class="muted" id="diagValveStatus"></div>
+        </section>
+
+        <footer class="muted" style="margin:14px 4px" id="uiVersion">UI version: …</footer>
+    </div>
+</body>
+</html>

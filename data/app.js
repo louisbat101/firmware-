@@ -74,6 +74,22 @@ function escapeHtml(s) {
         .replaceAll("'", '&#039;');
 }
 
+function renderFoundAddresses(addrs) {
+    const root = el('rsFound');
+    if (!root) return;
+    root.innerHTML = '';
+    if (!addrs || !addrs.length) {
+        root.innerHTML = '<div class="muted">No devices responded in the scanned range.</div>';
+        return;
+    }
+    for (const a of addrs) {
+        const row = document.createElement('div');
+        row.className = 'stat';
+        row.innerHTML = `<div class="label">Found Modbus device</div><div class="value">Addr ${escapeHtml(a)}</div>`;
+        root.appendChild(row);
+    }
+}
+
 async function refreshStatus() {
     const st = await api('/api/status');
     if (has('p1')) el('p1').textContent = st.pulses1;
@@ -107,6 +123,43 @@ async function refreshStatus() {
         ? `Batch: ${label} • ${delta}/${target} pulses`
         : `Batch: ${label}`;
     }
+
+    // Run page: show progress bar + remaining gallons
+    const pb = el('runProgress');
+    const rr = el('runRemain');
+    if (pb && rr) {
+        const cur = Number(bs.currentPulses ?? 0);
+        const start = Number(bs.startPulses ?? 0);
+        const target = Number(bs.targetPulses ?? 0);
+        const delta = Math.max(0, cur - start);
+
+        if (target > 0) {
+            const pct = Math.max(0, Math.min(100, (delta / target) * 100));
+            pb.value = pct;
+
+            // Remaining gallons = remaining pulses / product pulses-per-gallon
+            let ppg = 0;
+            try {
+                const pid = el('runProduct') ? Number(el('runProduct').value) : NaN;
+                const products = (st.products && Array.isArray(st.products)) ? st.products : null;
+                if (products) {
+                    const p = products.find(x => Number(x.id) === pid);
+                    if (p && typeof p.pulsesPerGallon === 'number') ppg = Number(p.pulsesPerGallon);
+                }
+            } catch {}
+
+            const remainingPulses = Math.max(0, target - delta);
+            if (ppg > 0) {
+                const remainingGal = remainingPulses / ppg;
+                rr.textContent = `${remainingGal.toFixed(2)} gal`;
+            } else {
+                rr.textContent = `${remainingPulses} pulses`;
+            }
+        } else {
+            pb.value = 0;
+            rr.textContent = '—';
+        }
+    }
 }
 
 async function refreshProducts() {
@@ -124,6 +177,16 @@ async function refreshProducts() {
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
+    // Show UI version (helps confirm caches are not serving stale assets)
+    if (has('uiVersion')) {
+        try {
+            const v = await api('/api/version');
+            el('uiVersion').textContent = `UI version: ${v.uiVersion || 'unknown'}`;
+        } catch {
+            el('uiVersion').textContent = '';
+        }
+    }
+
     // Setup page handlers
     if (has('resetPulses')) {
         el('resetPulses').addEventListener('click', async () => {
@@ -248,6 +311,45 @@ window.addEventListener('DOMContentLoaded', async () => {
                 if (valveStatus) valveStatus.textContent = 'Valve: error clear sent';
             } catch (e) {
                 if (valveStatus) valveStatus.textContent = `Valve error: ${e.message}`;
+            }
+        });
+    }
+
+    // Diagnostics page handlers
+    if (has('rsScan')) {
+        el('rsScan').addEventListener('click', async () => {
+            const status = el('rsStatus');
+            if (status) status.textContent = 'Scanning…';
+            try {
+                const start = parseInt(el('rsStart').value || '1', 10);
+                const end = parseInt(el('rsEnd').value || '10', 10);
+                const data = await api('/api/rs485/scan', { params: { start: String(start), end: String(end) } });
+                const found = data.found || [];
+                renderFoundAddresses(found);
+                if (status) {
+                    status.textContent = `RS485: baud ${data.baud} • TX ${data.txPin} RX ${data.rxPin} DE ${data.dePin} • Found ${found.length}`;
+                }
+            } catch (e) {
+                if (status) status.textContent = `Scan error: ${e.message}`;
+            }
+        });
+    }
+
+    if (has('diagValveRead')) {
+        el('diagValveRead').addEventListener('click', async () => {
+            const out = el('diagValveStatus');
+            if (out) out.textContent = 'Reading…';
+            try {
+                const s = await api('/api/status');
+                const v = s.valve || {};
+                const pos = (typeof v.positionDeg100 === 'number') ? v.positionDeg100 : null;
+                const err = (typeof v.error === 'number') ? v.error : null;
+                const parts = [];
+                if (pos !== null) parts.push(`pos=${pos}`);
+                if (err !== null) parts.push(`err=${err}`);
+                if (out) out.textContent = parts.length ? `Valve: ${parts.join(' • ')}` : 'Valve: no response';
+            } catch (e) {
+                if (out) out.textContent = `Valve read error: ${e.message}`;
             }
         });
     }
