@@ -72,6 +72,17 @@ async function refreshStatus() {
         el('calPpg').value = st.calibrationPulsesPerGallon || '';
     }
 
+    const vs = el('valveStatus');
+    if (vs) {
+        const v = st.valve || {};
+        const pos = (typeof v.positionDeg100 === 'number') ? v.positionDeg100 : null;
+        const err = (typeof v.error === 'number') ? v.error : null;
+        const parts = [];
+        if (pos !== null) parts.push(`pos=${pos}`);
+        if (err !== null) parts.push(`err=${err}`);
+        vs.textContent = parts.length ? `Valve: ${parts.join(' • ')}` : 'Valve: (no response yet)';
+    }
+
     const bs = st.batch || {};
     const rs = el('runStatus');
     if (rs) {
@@ -145,6 +156,56 @@ window.addEventListener('DOMContentLoaded', async () => {
                 await api('/api/batch/stop', { method: 'POST' });
             });
         }
+
+    // Valve controls
+    const valveOpen = el('valveOpen');
+    const valveClose = el('valveClose');
+    const valveSet = el('valveSet');
+    const valveDeg100 = el('valveDeg100');
+    const valveClearErr = el('valveClearErr');
+    const valveStatus = el('valveStatus');
+
+    if (valveOpen) {
+        valveOpen.addEventListener('click', async () => {
+            try {
+                await api('/api/valve/set', { method: 'POST', params: { deg100: '0' } });
+                if (valveStatus) valveStatus.textContent = 'Valve: commanded OPEN (0)';
+            } catch (e) {
+                if (valveStatus) valveStatus.textContent = `Valve error: ${e.message}`;
+            }
+        });
+    }
+    if (valveClose) {
+        valveClose.addEventListener('click', async () => {
+            try {
+                await api('/api/valve/set', { method: 'POST', params: { deg100: '9000' } });
+                if (valveStatus) valveStatus.textContent = 'Valve: commanded CLOSE (9000)';
+            } catch (e) {
+                if (valveStatus) valveStatus.textContent = `Valve error: ${e.message}`;
+            }
+        });
+    }
+    if (valveSet && valveDeg100) {
+        valveSet.addEventListener('click', async () => {
+            const v = String(parseInt(valveDeg100.value || '0', 10));
+            try {
+                await api('/api/valve/set', { method: 'POST', params: { deg100: v } });
+                if (valveStatus) valveStatus.textContent = `Valve: commanded ${v}`;
+            } catch (e) {
+                if (valveStatus) valveStatus.textContent = `Valve error: ${e.message}`;
+            }
+        });
+    }
+    if (valveClearErr) {
+        valveClearErr.addEventListener('click', async () => {
+            try {
+                await api('/api/valve/error/clear', { method: 'POST' });
+                if (valveStatus) valveStatus.textContent = 'Valve: error clear sent';
+            } catch (e) {
+                if (valveStatus) valveStatus.textContent = `Valve error: ${e.message}`;
+            }
+        });
+    }
 
     await refreshProducts();
     await refreshStatus();

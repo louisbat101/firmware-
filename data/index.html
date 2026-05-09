@@ -67,7 +67,7 @@
 
         <section class="card">
             <h2>Batch Run</h2>
-            <p class="muted">Uses Sensor 1 (GPIO2) pulses. Valve control requires setting a real `VALVE_PIN` in firmware.</p>
+            <p class="muted">Uses Sensor 1 (GPIO2) pulses. Valve is controlled over RS485 Modbus-RTU.</p>
             <div class="row">
                 <label>
                     Product
@@ -81,6 +81,24 @@
                 <button id="runStop" class="btn danger">Stop</button>
             </div>
             <div class="muted" id="runStatus"></div>
+        </section>
+
+        <section class="card">
+            <h2>Valve Control (RS485 Modbus)</h2>
+            <p class="muted">Quick test tools. 0 = open, 9000 = closed (degrees × 100).</p>
+            <div class="row">
+                <button id="valveOpen" class="btn primary">Open</button>
+                <button id="valveClose" class="btn danger">Close</button>
+
+                <label>
+                    Set position (deg×100)
+                    <input id="valveDeg100" type="number" step="1" placeholder="0 or 9000" />
+                </label>
+                <button id="valveSet" class="btn">Set</button>
+
+                <button id="valveClearErr" class="btn">Clear error</button>
+            </div>
+            <div class="muted" id="valveStatus"></div>
         </section>
     </div>
 </body>
