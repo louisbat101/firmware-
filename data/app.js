@@ -18,6 +18,10 @@ function el(id) {
     return document.getElementById(id);
 }
 
+function has(id) {
+    return !!document.getElementById(id);
+}
+
 function renderProducts(list) {
     const root = el('products');
     root.innerHTML = '';
@@ -66,9 +70,9 @@ function escapeHtml(s) {
 
 async function refreshStatus() {
     const st = await api('/api/status');
-    el('p1').textContent = st.pulses1;
-    el('p2').textContent = st.pulses2;
-    if (typeof st.calibrationPulsesPerGallon === 'number') {
+    if (has('p1')) el('p1').textContent = st.pulses1;
+    if (has('p2')) el('p2').textContent = st.pulses2;
+    if (has('calPpg') && typeof st.calibrationPulsesPerGallon === 'number') {
         el('calPpg').value = st.calibrationPulsesPerGallon || '';
     }
 
@@ -101,43 +105,51 @@ async function refreshStatus() {
 
 async function refreshProducts() {
     const data = await api('/api/products');
-    renderProducts(data.products || []);
-    renderRunProducts(data.products || []);
+    const list = data.products || [];
+    if (has('products')) renderProducts(list);
+    if (has('runProduct')) renderRunProducts(list);
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
-    el('resetPulses').addEventListener('click', async () => {
-        await api('/api/pulses/reset', { method: 'POST' });
-        await refreshStatus();
-    });
-
-    el('saveCal').addEventListener('click', async () => {
-        el('calStatus').textContent = '';
-        try {
-            const ppg = parseFloat(el('calPpg').value || '0');
-            await api('/api/calibration', { method: 'POST', params: { pulsesPerGallon: String(ppg) } });
-            el('calStatus').textContent = 'Saved.';
-        } catch (e) {
-            el('calStatus').textContent = `Error: ${e.message}`;
-        }
-    });
-
-    el('addProd').addEventListener('click', async () => {
-        const name = el('prodName').value.trim();
-        const pulsesPerGallon = parseFloat(el('prodPpg').value || '0');
-        const valveCloseTimeMs = parseInt(el('prodClose').value || '0', 10);
-        if (!name) return;
-        await api('/api/products', {
-            method: 'POST',
-            params: {
-                name,
-                pulsesPerGallon: String(pulsesPerGallon),
-                valveCloseTimeMs: String(valveCloseTimeMs),
-            },
+    // Setup page handlers
+    if (has('resetPulses')) {
+        el('resetPulses').addEventListener('click', async () => {
+            await api('/api/pulses/reset', { method: 'POST' });
+            await refreshStatus();
         });
-        el('prodName').value = '';
-        await refreshProducts();
-    });
+    }
+
+    if (has('saveCal')) {
+        el('saveCal').addEventListener('click', async () => {
+            if (has('calStatus')) el('calStatus').textContent = '';
+            try {
+                const ppg = parseFloat(el('calPpg').value || '0');
+                await api('/api/calibration', { method: 'POST', params: { pulsesPerGallon: String(ppg) } });
+                if (has('calStatus')) el('calStatus').textContent = 'Saved.';
+            } catch (e) {
+                if (has('calStatus')) el('calStatus').textContent = `Error: ${e.message}`;
+            }
+        });
+    }
+
+    if (has('addProd')) {
+        el('addProd').addEventListener('click', async () => {
+            const name = el('prodName').value.trim();
+            const pulsesPerGallon = parseFloat(el('prodPpg').value || '0');
+            const valveCloseTimeMs = parseInt(el('prodClose').value || '0', 10);
+            if (!name) return;
+            await api('/api/products', {
+                method: 'POST',
+                params: {
+                    name,
+                    pulsesPerGallon: String(pulsesPerGallon),
+                    valveCloseTimeMs: String(valveCloseTimeMs),
+                },
+            });
+            el('prodName').value = '';
+            await refreshProducts();
+        });
+    }
 
         const runStart = el('runStart');
         const runStop = el('runStop');
@@ -207,7 +219,16 @@ window.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
-    await refreshProducts();
+    // Initial loads
+    // Always load products if the page needs them (runProduct select or products list)
+    if (has('runProduct') || has('products')) {
+        await refreshProducts();
+    }
     await refreshStatus();
-    setInterval(() => refreshStatus().catch(() => {}), 500);
+
+    // Polling: run page needs faster updates (batch progress + valve status).
+    // Setup page can be slower.
+    const needsFast = has('runStatus') || has('valveStatus');
+    const pollMs = needsFast ? 500 : 1500;
+    setInterval(() => refreshStatus().catch(() => {}), pollMs);
 });
