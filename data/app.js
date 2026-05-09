@@ -104,7 +104,14 @@ async function refreshStatus() {
 }
 
 async function refreshProducts() {
-    const data = await api('/api/products');
+    // Occasionally the ESP can be busy; a quick retry makes the UI feel more reliable.
+    let data;
+    try {
+        data = await api('/api/products');
+    } catch (e) {
+        await new Promise(r => setTimeout(r, 150));
+        data = await api('/api/products');
+    }
     const list = data.products || [];
     if (has('products')) renderProducts(list);
     if (has('runProduct')) renderRunProducts(list);
@@ -147,6 +154,12 @@ window.addEventListener('DOMContentLoaded', async () => {
                 },
             });
             el('prodName').value = '';
+            await refreshProducts();
+        });
+    }
+
+    if (has('refreshProducts')) {
+        el('refreshProducts').addEventListener('click', async () => {
             await refreshProducts();
         });
     }

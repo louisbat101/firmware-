@@ -290,6 +290,7 @@ static bool valveClearError() {
 static bool loadConfig() {
   g_cfg = Config();
   if (!LittleFS.exists(CONFIG_PATH)) {
+    Serial.println("Config: /config.json not found (starting fresh)");
     return false;
   }
 
@@ -331,9 +332,13 @@ static bool saveConfig() {
   }
 
   File f = LittleFS.open(CONFIG_PATH, "w");
-  if (!f) return false;
+  if (!f) {
+    Serial.println("Config: failed to open /config.json for write");
+    return false;
+  }
   const size_t n = serializeJson(doc, f);
   f.close();
+  if (n == 0) Serial.println("Config: serializeJson wrote 0 bytes");
   return n > 0;
 }
 
