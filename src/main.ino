@@ -3,8 +3,12 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 
-// --- RS485 / Modbus RTU (proportional valve) ---
-#include <HardwareSerial.h>
+// ESP-IDF GPIO driver for early pin-level control (boot-glitch mitigation)
+#include <driver/gpio.h>
+
+// --- Valve control ---
+// Switched to a simple 12V 3-wire motorized valve driven by a 2-relay module.
+// Relays switch +12V to either the OPEN wire or the CLOSE wire (never both).
 
 // This project runs as a Wi-Fi hotspot (AP mode). Connect your phone/laptop to this SSID.
 const char* apSsid = "ESP32C3-Keypad";
@@ -30,19 +34,71 @@ static volatile char g_lastKey = 0;
 static const int FLOW_PIN_1 = 2;
 static const int FLOW_PIN_2 = 3;
 
-// Valve control (set to a real pin when you wire it)
-// This build uses a Modbus-RTU proportional valve over RS485.
-// Wiring (ESP32-C3): TX=GPIO4, RX=GPIO5, CN(DE/RE)=GPIO6
-static const int RS485_TX_PIN = 4;
-static const int RS485_RX_PIN = 5;
-static const int RS485_DE_PIN = 6; // CN pin controls TX enable (DE/RE)
+// Relay module wiring (ESP32-C3 SuperMini):
+// - IN1 -> GPIO7
+// - IN2 -> GPIO8
+// Leave GPIO4/5/6 free for future RS485.
+static const int RELAY_OPEN_PIN = 7;
+static const int RELAY_CLOSE_PIN = 8;
 
-static const uint32_t RS485_BAUD = 9600; // datasheet: 9600 or 57600
-static const uint8_t MODBUS_ADDR = 0x01; // default device address
+// Valve wiring mode:
+// Your valve is "power + enable" style:
+// - Blue: GND
+// - Brown: constant +12V power (always on)
+// - Black: enable/control (+12V = OPEN, off = CLOSE)
+// That means we only need ONE relay channel to switch +12V to the BLACK wire.
+// RELAY_OPEN_PIN drives BLACK. RELAY_CLOSE_PIN is unused.
+static const bool VALVE_SINGLE_ENABLE_RELAY = true;
 
-// Valve positions are in degrees * 100: 0..9000 (0.00°..90.00°)
-static const int16_t VALVE_POS_OPEN = 0;     // 0° open
-static const int16_t VALVE_POS_CLOSED = 9000; // 90° closed
+// Many 2-relay boards are "active LOW" (IN=LOW energizes relay), but some are
+// "active HIGH" (IN=HIGH energizes relay). With no H/L jumper, the only way to
+// handle both is making it configurable.
+//
+// If your relay IN1 LED is ON all the time at boot, you're likely ACTIVE_HIGH
+// (because we default pins HIGH to keep them from floating). We'll default to
+// ACTIVE_HIGH and allow switching via API.
+static bool g_relayActiveLow = false;
+
+static inline int relayActiveLevel() {
+  return g_relayActiveLow ? LOW : HIGH;
+}
+
+static inline int relayInactiveLevel() {
+  return g_relayActiveLow ? HIGH : LOW;
+}
+
+static void relayBootSafeInit() {
+  // Attempt to prevent a brief relay ON at boot by:
+  // 1) configuring GPIO as output via IDF
+  // 2) driving it to the INACTIVE level immediately
+  // 3) enabling an internal pull that biases toward INACTIVE
+  const int inactive = relayInactiveLevel();
+
+  auto initPin = [&](int pin) {
+    gpio_reset_pin((gpio_num_t)pin);
+    gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)pin, (inactive == HIGH) ? 1 : 0);
+
+    // Bias the pin so it doesn't float during transitions.
+    // If inactive is HIGH => enable pull-up.
+    // If inactive is LOW  => enable pull-down.
+    gpio_set_pull_mode((gpio_num_t)pin, (inactive == HIGH) ? GPIO_PULLUP_ONLY : GPIO_PULLDOWN_ONLY);
+  };
+
+  initPin(RELAY_OPEN_PIN);
+  initPin(RELAY_CLOSE_PIN);
+}
+
+// How long to energize a relay for an open/close command.
+// Your valve label shows ~3s; we default to 3500ms.
+// You reported ~4 seconds to fully open/close, so set default to 4000ms.
+static const uint32_t VALVE_DRIVE_OPEN_MS_DEFAULT = 4000;
+static const uint32_t VALVE_DRIVE_CLOSE_MS_DEFAULT = 4000;
+
+static uint32_t g_valveDriveOpenMs = VALVE_DRIVE_OPEN_MS_DEFAULT;
+static uint32_t g_valveDriveCloseMs = VALVE_DRIVE_CLOSE_MS_DEFAULT;
+static uint32_t g_valveDriveUntilMs = 0;
+static int8_t g_valveDriveDir = 0; // -1 closing, +1 opening, 0 idle
 
 static volatile uint32_t g_pulses1 = 0;
 static volatile uint32_t g_pulses2 = 0;
@@ -68,7 +124,6 @@ static bool valveClearError();
 static bool valveReadError(uint16_t* outErr);
 static void batchStopInternal();
 static float productPulsesPerGallon(const Product& p);
-static bool modbusPingAddress(uint8_t addr);
 
 // Config persisted in LittleFS
 static const char* CONFIG_PATH = "/config.json";
@@ -81,6 +136,8 @@ struct Product {
 
 struct Config {
   float calibrationPulsesPerGallon = 0.0f; // optional global calibration
+  uint32_t valveDriveOpenMs = VALVE_DRIVE_OPEN_MS_DEFAULT;
+  uint32_t valveDriveCloseMs = VALVE_DRIVE_CLOSE_MS_DEFAULT;
   Product products[10];
   size_t productCount = 0;
 };
@@ -92,6 +149,14 @@ static void batchStopInternal() {
   g_batchState = BatchState::Idle;
   g_batchTargetPulses = 0;
   g_batchProductId = -1;
+}
+
+static void relayValveStop() {
+  const int inactive = relayInactiveLevel();
+  digitalWrite(RELAY_OPEN_PIN, inactive);
+  digitalWrite(RELAY_CLOSE_PIN, inactive);
+  g_valveDriveUntilMs = 0;
+  g_valveDriveDir = 0;
 }
 
 static float productPulsesPerGallon(const Product& p) {
@@ -118,192 +183,55 @@ static uint32_t readValue(volatile uint32_t& v) {
 }
 
 static void valveWrite(bool open) {
-  // Map the legacy open/close semantic to the proportional valve's position set.
-  // Note: This is synchronous and may take a few ms; acceptable for our state machine.
-  const int16_t target = open ? VALVE_POS_OPEN : VALVE_POS_CLOSED;
-  (void)valveSetPositionDeg100(target);
-}
+  const int inactive = relayInactiveLevel();
+  const int active = relayActiveLevel();
 
-// ---------------------------
-// Modbus RTU helpers
-// ---------------------------
+  // Always start from a known safe state.
+  digitalWrite(RELAY_OPEN_PIN, inactive);
+  digitalWrite(RELAY_CLOSE_PIN, inactive);
 
-static HardwareSerial RS485(1);
-
-static void rs485SetTx(bool enable) {
-  // Many RS485 modules use DE+RE tied together.
-  digitalWrite(RS485_DE_PIN, enable ? HIGH : LOW);
-  // Small settle time helps some transceivers
-  delayMicroseconds(50);
-}
-
-static uint16_t modbusCrc16(const uint8_t* data, size_t len) {
-  uint16_t crc = 0xFFFF;
-  for (size_t i = 0; i < len; i++) {
-    crc ^= data[i];
-    for (int b = 0; b < 8; b++) {
-      if (crc & 1) {
-        crc = (crc >> 1) ^ 0xA001;
-      } else {
-        crc >>= 1;
-      }
-    }
-  }
-  return crc;
-}
-
-static void modbusDrainRx() {
-  while (RS485.available() > 0) (void)RS485.read();
-}
-
-static bool modbusSendAndRead(const uint8_t* req, size_t reqLen, uint8_t* resp, size_t respCap, size_t* outRespLen,
-                              uint32_t timeoutMs = 200) {
-  if (outRespLen) *outRespLen = 0;
-
-  modbusDrainRx();
-
-  rs485SetTx(true);
-  RS485.write(req, reqLen);
-  RS485.flush();
-  rs485SetTx(false);
-
-  const uint32_t start = millis();
-  size_t n = 0;
-  while ((millis() - start) < timeoutMs) {
-    while (RS485.available() > 0) {
-      const int c = RS485.read();
-      if (c < 0) break;
-      if (n < respCap) resp[n++] = (uint8_t)c;
-    }
-
-    // Heuristic: if we have at least address+func+crc and no new bytes for a bit, stop.
-    if (n >= 5) {
-      // quick idle wait to accumulate remaining bytes
-      delay(2);
-      if (RS485.available() == 0) break;
-    }
-    delay(1);
+  if (VALVE_SINGLE_ENABLE_RELAY) {
+    // Single-enable valve behavior (BLACK enable wire):
+    // - OPEN  => energize relay continuously
+    // - CLOSE => de-energize relay continuously
+    // No timed auto-stop here (it causes the "click again" reopen behavior).
+    g_valveDriveUntilMs = 0;
+    g_valveDriveDir = open ? 1 : -1;
+    digitalWrite(RELAY_OPEN_PIN, open ? active : inactive);
+    return;
   }
 
-  if (outRespLen) *outRespLen = n;
-  if (n < 5) return false;
-
-  const uint16_t gotCrc = (uint16_t)resp[n - 2] | ((uint16_t)resp[n - 1] << 8);
-  const uint16_t calcCrc = modbusCrc16(resp, n - 2);
-  if (gotCrc != calcCrc) return false;
-
-  return true;
+  // Two-relay directional mode (legacy): drive for a fixed period.
+  const uint32_t driveMs = open ? g_valveDriveOpenMs : g_valveDriveCloseMs;
+  g_valveDriveUntilMs = nowMs() + driveMs;
+  g_valveDriveDir = open ? 1 : -1;
+  if (open) digitalWrite(RELAY_OPEN_PIN, active);
+  else digitalWrite(RELAY_CLOSE_PIN, active);
 }
 
-static bool modbusReadHoldingRegisters(uint8_t addr, uint16_t startReg, uint16_t regCount, uint16_t* outRegs) {
-  if (regCount == 0 || regCount > 125) return false;
-
-  uint8_t req[8];
-  req[0] = addr;
-  req[1] = 0x03;
-  req[2] = (uint8_t)(startReg >> 8);
-  req[3] = (uint8_t)(startReg & 0xFF);
-  req[4] = (uint8_t)(regCount >> 8);
-  req[5] = (uint8_t)(regCount & 0xFF);
-  const uint16_t crc = modbusCrc16(req, 6);
-  req[6] = (uint8_t)(crc & 0xFF);
-  req[7] = (uint8_t)(crc >> 8);
-
-  uint8_t resp[256];
-  size_t n = 0;
-  if (!modbusSendAndRead(req, sizeof(req), resp, sizeof(resp), &n)) return false;
-
-  if (resp[0] != addr) return false;
-  if (resp[1] != 0x03) return false;
-  const uint8_t byteCount = resp[2];
-  if (byteCount != regCount * 2) return false;
-  if (n < (size_t)(3 + byteCount + 2)) return false;
-
-  for (uint16_t i = 0; i < regCount; i++) {
-    const uint8_t hi = resp[3 + i * 2];
-    const uint8_t lo = resp[3 + i * 2 + 1];
-    outRegs[i] = (uint16_t)hi << 8 | lo;
-  }
-  return true;
-}
-
-static bool modbusPingAddress(uint8_t addr) {
-  // Try a very small read; most devices either respond or time out.
-  uint16_t r = 0;
-  return modbusReadHoldingRegisters(addr, 0x0000, 1, &r);
-}
-
-static bool modbusWriteMultipleRegisters(uint8_t addr, uint16_t startReg, uint16_t regCount, const uint16_t* regs) {
-  if (regCount == 0 || regCount > 123) return false;
-  const uint8_t byteCount = (uint8_t)(regCount * 2);
-  if (byteCount + 9 > 255) return false;
-
-  uint8_t req[255];
-  size_t idx = 0;
-  req[idx++] = addr;
-  req[idx++] = 0x10;
-  req[idx++] = (uint8_t)(startReg >> 8);
-  req[idx++] = (uint8_t)(startReg & 0xFF);
-  req[idx++] = (uint8_t)(regCount >> 8);
-  req[idx++] = (uint8_t)(regCount & 0xFF);
-  req[idx++] = byteCount;
-  for (uint16_t i = 0; i < regCount; i++) {
-    req[idx++] = (uint8_t)(regs[i] >> 8);
-    req[idx++] = (uint8_t)(regs[i] & 0xFF);
-  }
-  const uint16_t crc = modbusCrc16(req, idx);
-  req[idx++] = (uint8_t)(crc & 0xFF);
-  req[idx++] = (uint8_t)(crc >> 8);
-
-  uint8_t resp[16];
-  size_t n = 0;
-  if (!modbusSendAndRead(req, idx, resp, sizeof(resp), &n)) return false;
-
-  // Expected response: addr 0x10 startHi startLo countHi countLo crcLo crcHi
-  if (n < 8) return false;
-  if (resp[0] != addr) return false;
-  if (resp[1] != 0x10) return false;
-  const uint16_t rStart = (uint16_t)resp[2] << 8 | resp[3];
-  const uint16_t rCount = (uint16_t)resp[4] << 8 | resp[5];
-  if (rStart != startReg) return false;
-  if (rCount != regCount) return false;
-  return true;
-}
-
-// Register map from your doc
-static const uint16_t REG_DEVICE_ADDR = 0x0000;
-static const uint16_t REG_POSITION_SET = 0x0001;
-static const uint16_t REG_ERROR_STATE = 0x0002;
-static const uint16_t REG_POSITION_FEEDBACK = 0x0003;
-
-static bool valveSetPositionDeg100(int16_t deg100) {
-  // Clamp to device documented range (we only use 0..9000 normally)
-  if (deg100 < -10500) deg100 = -10500;
-  if (deg100 > 19500) deg100 = 19500;
-
-  const uint16_t v = (uint16_t)deg100; // keep two's complement bit pattern
-  return modbusWriteMultipleRegisters(MODBUS_ADDR, REG_POSITION_SET, 1, &v);
-}
-
+// Relay valve "status" is inferred from last command.
 static bool valveReadPositionDeg100(int16_t* outDeg100) {
-  uint16_t r = 0;
-  const bool ok = modbusReadHoldingRegisters(MODBUS_ADDR, REG_POSITION_FEEDBACK, 1, &r);
-  if (!ok) return false;
-  if (outDeg100) *outDeg100 = (int16_t)r;
+  if (!outDeg100) return true;
+  // Unknown actual angle; return 0 (open) or 9000 (closed) based on last direction.
+  if (g_valveDriveDir > 0) *outDeg100 = 0;
+  else if (g_valveDriveDir < 0) *outDeg100 = 9000;
+  else *outDeg100 = -32768;
   return true;
 }
 
 static bool valveReadError(uint16_t* outErr) {
-  uint16_t r = 0;
-  const bool ok = modbusReadHoldingRegisters(MODBUS_ADDR, REG_ERROR_STATE, 1, &r);
-  if (!ok) return false;
-  if (outErr) *outErr = r;
+  if (outErr) *outErr = 0;
   return true;
 }
 
 static bool valveClearError() {
-  const uint16_t zero = 0;
-  return modbusWriteMultipleRegisters(MODBUS_ADDR, REG_ERROR_STATE, 1, &zero);
+  return true;
+}
+
+static bool valveSetPositionDeg100(int16_t deg100) {
+  // Maintain compatibility with UI/API: <=4500 => open, else close
+  valveWrite(deg100 <= 4500);
+  return true;
 }
 
 static bool loadConfig() {
@@ -325,6 +253,14 @@ static bool loadConfig() {
   }
 
   g_cfg.calibrationPulsesPerGallon = doc["calibrationPulsesPerGallon"].as<float>();
+  g_cfg.valveDriveOpenMs = doc["valveDriveOpenMs"] | VALVE_DRIVE_OPEN_MS_DEFAULT;
+  g_cfg.valveDriveCloseMs = doc["valveDriveCloseMs"] | VALVE_DRIVE_CLOSE_MS_DEFAULT;
+  // Relay polarity (default: ACTIVE_HIGH)
+  g_relayActiveLow = doc["relayActiveLow"] | false;
+
+  // Apply to runtime variables
+  g_valveDriveOpenMs = g_cfg.valveDriveOpenMs;
+  g_valveDriveCloseMs = g_cfg.valveDriveCloseMs;
   JsonArray prods = doc["products"].as<JsonArray>();
   if (!prods.isNull()) {
     for (JsonObject p : prods) {
@@ -342,6 +278,9 @@ static bool loadConfig() {
 static bool saveConfig() {
   JsonDocument doc;
   doc["calibrationPulsesPerGallon"] = g_cfg.calibrationPulsesPerGallon;
+  doc["valveDriveOpenMs"] = g_cfg.valveDriveOpenMs;
+  doc["valveDriveCloseMs"] = g_cfg.valveDriveCloseMs;
+  doc["relayActiveLow"] = g_relayActiveLow;
   JsonArray prods = doc["products"].to<JsonArray>();
   for (size_t i = 0; i < g_cfg.productCount; i++) {
     JsonObject p = prods.add<JsonObject>();
@@ -407,11 +346,13 @@ void setup() {
   Serial.println("Booting ESP32-C3 keypad AP...");
   WiFi.onEvent(onWiFiEvent);
 
-  // RS485 / Modbus setup
-  pinMode(RS485_DE_PIN, OUTPUT);
-  rs485SetTx(false); // receive mode
-  // UART1 on ESP32-C3 can be mapped to arbitrary GPIOs.
-  RS485.begin(RS485_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+  // Relay boot safety: drive relay pins to INACTIVE as early as possible.
+  relayBootSafeInit();
+
+  // Relay valve setup (Arduino layer)
+  pinMode(RELAY_OPEN_PIN, OUTPUT);
+  pinMode(RELAY_CLOSE_PIN, OUTPUT);
+  relayValveStop();
 
   // LittleFS mount. If it fails (e.g., fresh chip or corrupted FS), format and retry.
   g_fsMounted = LittleFS.begin(false);
@@ -426,6 +367,9 @@ void setup() {
   }
 
   loadConfig();
+
+  // Re-apply stop after loading polarity from config.
+  relayValveStop();
 
   pinMode(FLOW_PIN_1, INPUT_PULLUP);
   pinMode(FLOW_PIN_2, INPUT_PULLUP);
@@ -493,6 +437,9 @@ void setup() {
     if (valveReadError(&err)) {
       doc["valve"]["error"] = (uint32_t)err;
     }
+
+    doc["valve"]["driveOpenMs"] = (uint32_t)g_valveDriveOpenMs;
+    doc["valve"]["driveCloseMs"] = (uint32_t)g_valveDriveCloseMs;
 
     const BatchState st = g_batchState;
     const uint32_t cur = readValue(g_pulses1);
@@ -570,43 +517,108 @@ void setup() {
     server.send(204, "text/plain", "");
   });
 
-  // RS485 / Modbus diagnostics
-  // Scans a small range of Modbus addresses to see who responds.
-  server.on("/api/rs485/scan", HTTP_GET, []() {
-    // Optional query params: start=1 end=10
-    int start = 1;
-    int end = 10;
-    if (server.hasArg("start")) start = server.arg("start").toInt();
-    if (server.hasArg("end")) end = server.arg("end").toInt();
-    if (start < 1) start = 1;
-    if (end > 247) end = 247;
-    if (end < start) end = start;
-    // Keep it bounded so we don't block the UI for too long
-    if ((end - start) > 31) end = start + 31;
-
-    JsonDocument doc;
-    doc["baud"] = (uint32_t)RS485_BAUD;
-    doc["txPin"] = (int)RS485_TX_PIN;
-    doc["rxPin"] = (int)RS485_RX_PIN;
-    doc["dePin"] = (int)RS485_DE_PIN;
-    doc["defaultAddr"] = (uint32_t)MODBUS_ADDR;
-
-    JsonArray found = doc["found"].to<JsonArray>();
-    uint32_t okCount = 0;
-    for (int addr = start; addr <= end; addr++) {
-      if (modbusPingAddress((uint8_t)addr)) {
-        found.add((uint32_t)addr);
-        okCount++;
-      }
-      delay(10);
-      yield();
-    }
-    doc["okCount"] = okCount;
-
-    String body;
-    serializeJson(doc, body);
-    server.send(200, "application/json", body);
+  // Immediately stop driving the valve (de-energize relays)
+  server.on("/api/valve/stop", HTTP_POST, []() {
+    relayValveStop();
+    server.send(204, "text/plain", "");
   });
+
+  // Valve drive tuning (ms)
+  server.on("/api/valve/drive_ms", HTTP_GET, []() {
+    JsonDocument doc;
+    doc["openMs"] = (uint32_t)g_valveDriveOpenMs;
+    doc["closeMs"] = (uint32_t)g_valveDriveCloseMs;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+
+  // POST openMs=... closeMs=...
+  server.on("/api/valve/drive_ms", HTTP_POST, []() {
+    if (!ensureFS()) {
+      sendText(500, "filesystem not mounted");
+      return;
+    }
+    if (!server.hasArg("openMs") && !server.hasArg("closeMs")) {
+      sendText(400, "missing openMs/closeMs");
+      return;
+    }
+
+    // Guardrails: 50ms..10000ms
+    auto clampMs = [](uint32_t v) -> uint32_t {
+      if (v < 50) return 50;
+      if (v > 10000) return 10000;
+      return v;
+    };
+
+    if (server.hasArg("openMs")) {
+      const uint32_t v = (uint32_t)server.arg("openMs").toInt();
+      g_valveDriveOpenMs = clampMs(v);
+      g_cfg.valveDriveOpenMs = g_valveDriveOpenMs;
+    }
+    if (server.hasArg("closeMs")) {
+      const uint32_t v = (uint32_t)server.arg("closeMs").toInt();
+      g_valveDriveCloseMs = clampMs(v);
+      g_cfg.valveDriveCloseMs = g_valveDriveCloseMs;
+    }
+
+    const bool ok = saveConfig();
+    server.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+  });
+
+  // Relay polarity control (for boards without H/L jumper)
+  // GET returns activeLow bool. POST activeLow=0/1 updates and persists.
+  server.on("/api/relay/polarity", HTTP_GET, []() {
+    JsonDocument doc;
+    doc["activeLow"] = g_relayActiveLow;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+
+  server.on("/api/relay/polarity", HTTP_POST, []() {
+    if (!ensureFS()) {
+      sendText(500, "filesystem not mounted");
+      return;
+    }
+    if (!server.hasArg("activeLow")) {
+      sendText(400, "missing activeLow");
+      return;
+    }
+    const int v = server.arg("activeLow").toInt();
+    g_relayActiveLow = (v != 0);
+    relayValveStop();
+    const bool ok = saveConfig();
+    server.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+  });
+
+  // Raw relay/GPIO test (bypasses valve logic) to debug "IN1 LED stuck on".
+  // POST /api/relay/test?pin=7&level=0|1
+  // Only allows the relay pins for safety.
+  server.on("/api/relay/test", HTTP_POST, []() {
+    if (!server.hasArg("pin") || !server.hasArg("level")) {
+      sendText(400, "missing pin/level");
+      return;
+    }
+    const int pin = server.arg("pin").toInt();
+    if (pin != RELAY_OPEN_PIN && pin != RELAY_CLOSE_PIN) {
+      sendText(400, "pin not allowed");
+      return;
+    }
+    const int level = server.arg("level").toInt() ? HIGH : LOW;
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, level);
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["pin"] = pin;
+    doc["level"] = (level == HIGH) ? 1 : 0;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+  });
+
+  // Diagnostics: RS485 removed (valve is relay-controlled)
+  // RS485 diagnostics removed (valve now driven via relays)
   // Start a batch: productId + gallons. Uses sensor1 pulses.
   server.on("/api/batch/start", HTTP_POST, []() {
     if (!server.hasArg("productId") || !server.hasArg("gallons")) {
@@ -842,6 +854,11 @@ void setup() {
 
 void loop() {
   server.handleClient();
+
+  // Relay valve auto-stop
+  if (g_valveDriveUntilMs != 0 && (int32_t)(nowMs() - g_valveDriveUntilMs) >= 0) {
+    relayValveStop();
+  }
 
   // Batch state machine
   const BatchState st = g_batchState;

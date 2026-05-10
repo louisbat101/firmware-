@@ -1,10 +1,18 @@
-async function api(path, { method = 'GET', params } = {}) {
+async function api(path, { method = 'GET', params, timeoutMs = 2500 } = {}) {
     let url = path;
     if (params) {
         const qs = new URLSearchParams(params);
         url += `?${qs.toString()}`;
     }
-    const res = await fetch(url, { method });
+
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), timeoutMs);
+    let res;
+    try {
+        res = await fetch(url, { method, signal: ac.signal });
+    } finally {
+        clearTimeout(t);
+    }
     if (!res.ok) {
         const t = await res.text().catch(() => '');
         throw new Error(`${res.status} ${res.statusText} ${t}`);
@@ -90,8 +98,61 @@ function renderFoundAddresses(addrs) {
     }
 }
 
+function renderMultiBaudResults(results) {
+    const root = el('rsFound');
+    if (!root) return;
+    root.innerHTML = '';
+    if (!results || !results.length) {
+        root.innerHTML = '<div class="muted">No results.</div>';
+        return;
+    }
+
+    for (const row of results) {
+        const baud = row.baud;
+        const found = row.found || [];
+        const card = document.createElement('div');
+        card.className = 'stat';
+        const list = found.length ? found.map(a => `Addr ${escapeHtml(a)}`).join(', ') : 'None';
+        card.innerHTML = `
+            <div class="label">Baud ${escapeHtml(baud)}</div>
+            <div class="value" style="font-size:16px">${list}</div>
+        `;
+        root.appendChild(card);
+    }
+}
+
+function renderValveBaudResults(results) {
+    const root = el('valveBaudResults');
+    if (!root) return;
+    root.innerHTML = '';
+    for (const r of (results || [])) {
+        const row = document.createElement('div');
+        row.className = 'stat';
+        const ok = !!r.any;
+        const parts = [];
+        parts.push(ok ? 'OK' : 'NO RESP');
+        if (r.posOk) parts.push(`pos=${r.posDeg100}`);
+        if (r.errOk) parts.push(`err=${r.err}`);
+        row.innerHTML = `
+            <div class="label">Baud ${escapeHtml(r.baud)}</div>
+            <div class="value" style="font-size:16px">${escapeHtml(parts.join(' • '))}</div>
+        `;
+        root.appendChild(row);
+    }
+}
+
 async function refreshStatus() {
     const st = await api('/api/status');
+
+    // Connection indicator (Run page)
+    try {
+        window.__lastStatusOkAt = Date.now();
+        const dot = document.getElementById('connDot');
+        const txt = document.getElementById('connText');
+        if (dot) dot.style.background = '#2ecc71';
+        if (txt) txt.textContent = 'connected';
+    } catch {}
+
     if (has('p1')) el('p1').textContent = st.pulses1;
     if (has('p2')) el('p2').textContent = st.pulses2;
     if (has('calPpg') && typeof st.calibrationPulsesPerGallon === 'number') {
@@ -177,6 +238,19 @@ async function refreshProducts() {
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
+    // Diagnostics: persist inputs so you don't have to keep retyping values.
+    const lsGetInt = (k, def) => {
+        try {
+            const v = localStorage.getItem(k);
+            if (v === null || v === undefined || v === '') return def;
+            const n = parseInt(v, 10);
+            return Number.isFinite(n) ? n : def;
+        } catch {
+            return def;
+        }
+    };
+    const lsSet = (k, v) => { try { localStorage.setItem(k, String(v)); } catch {} };
+
     // Show UI version (helps confirm caches are not serving stale assets)
     if (has('uiVersion')) {
         try {
@@ -249,6 +323,7 @@ window.addEventListener('DOMContentLoaded', async () => {
 
         const runStart = el('runStart');
         const runStop = el('runStop');
+        const runReset = has('runReset') ? el('runReset') : null;
         if (runStart && runStop) {
             runStart.addEventListener('click', async () => {
                 const productId = el('runProduct').value;
@@ -263,6 +338,17 @@ window.addEventListener('DOMContentLoaded', async () => {
             runStop.addEventListener('click', async () => {
                 await api('/api/batch/stop', { method: 'POST' });
             });
+
+            if (runReset) {
+                runReset.addEventListener('click', async () => {
+                    try {
+                        await api('/api/pulses/reset', { method: 'POST' });
+                        await refreshStatus();
+                    } catch (e) {
+                        el('runStatus').textContent = `Reset error: ${e.message}`;
+                    }
+                });
+            }
         }
 
     // Valve controls
@@ -276,7 +362,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (valveOpen) {
         valveOpen.addEventListener('click', async () => {
             try {
-                await api('/api/valve/set', { method: 'POST', params: { deg100: '0' } });
+                if (valveStatus) valveStatus.textContent = 'Valve: OPEN…';
+                await api('/api/valve/set', { method: 'POST', params: { deg100: '0' }, timeoutMs: 1200 });
                 if (valveStatus) valveStatus.textContent = 'Valve: commanded OPEN (0)';
             } catch (e) {
                 if (valveStatus) valveStatus.textContent = `Valve error: ${e.message}`;
@@ -286,7 +373,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (valveClose) {
         valveClose.addEventListener('click', async () => {
             try {
-                await api('/api/valve/set', { method: 'POST', params: { deg100: '9000' } });
+                if (valveStatus) valveStatus.textContent = 'Valve: CLOSE…';
+                await api('/api/valve/set', { method: 'POST', params: { deg100: '9000' }, timeoutMs: 1200 });
                 if (valveStatus) valveStatus.textContent = 'Valve: commanded CLOSE (9000)';
             } catch (e) {
                 if (valveStatus) valveStatus.textContent = `Valve error: ${e.message}`;
@@ -315,41 +403,48 @@ window.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
-    // Diagnostics page handlers
-    if (has('rsScan')) {
-        el('rsScan').addEventListener('click', async () => {
-            const status = el('rsStatus');
-            if (status) status.textContent = 'Scanning…';
+    // Diagnostics page handlers (relay valve)
+    const driveOpenMs = has('driveOpenMs') ? el('driveOpenMs') : null;
+    const driveCloseMs = has('driveCloseMs') ? el('driveCloseMs') : null;
+    const driveSave = has('driveSave') ? el('driveSave') : null;
+    const valveStop = has('valveStop') ? el('valveStop') : null;
+
+    if (driveOpenMs) driveOpenMs.value = String(lsGetInt('diag.driveOpenMs', parseInt(driveOpenMs.value || '4000', 10)));
+    if (driveCloseMs) driveCloseMs.value = String(lsGetInt('diag.driveCloseMs', parseInt(driveCloseMs.value || '4000', 10)));
+
+    // Pull current values from device
+    if (driveOpenMs && driveCloseMs) {
+        try {
+            const cur = await api('/api/valve/drive_ms');
+            if (typeof cur.openMs === 'number') driveOpenMs.value = String(cur.openMs);
+            if (typeof cur.closeMs === 'number') driveCloseMs.value = String(cur.closeMs);
+        } catch {}
+    }
+
+    if (driveSave && driveOpenMs && driveCloseMs) {
+        driveSave.addEventListener('click', async () => {
+            const vs = has('valveStatus') ? el('valveStatus') : null;
+            if (vs) vs.textContent = '';
             try {
-                const start = parseInt(el('rsStart').value || '1', 10);
-                const end = parseInt(el('rsEnd').value || '10', 10);
-                const data = await api('/api/rs485/scan', { params: { start: String(start), end: String(end) } });
-                const found = data.found || [];
-                renderFoundAddresses(found);
-                if (status) {
-                    status.textContent = `RS485: baud ${data.baud} • TX ${data.txPin} RX ${data.rxPin} DE ${data.dePin} • Found ${found.length}`;
-                }
+                const o = parseInt(driveOpenMs.value || '4000', 10);
+                const c = parseInt(driveCloseMs.value || '4000', 10);
+                lsSet('diag.driveOpenMs', o);
+                lsSet('diag.driveCloseMs', c);
+                await api('/api/valve/drive_ms', { method: 'POST', params: { openMs: String(o), closeMs: String(c) } });
+                if (vs) vs.textContent = `Saved: open=${o}ms close=${c}ms`;
             } catch (e) {
-                if (status) status.textContent = `Scan error: ${e.message}`;
+                if (vs) vs.textContent = `Save error: ${e.message}`;
             }
         });
     }
 
-    if (has('diagValveRead')) {
-        el('diagValveRead').addEventListener('click', async () => {
-            const out = el('diagValveStatus');
-            if (out) out.textContent = 'Reading…';
+    if (valveStop) {
+        valveStop.addEventListener('click', async () => {
             try {
-                const s = await api('/api/status');
-                const v = s.valve || {};
-                const pos = (typeof v.positionDeg100 === 'number') ? v.positionDeg100 : null;
-                const err = (typeof v.error === 'number') ? v.error : null;
-                const parts = [];
-                if (pos !== null) parts.push(`pos=${pos}`);
-                if (err !== null) parts.push(`err=${err}`);
-                if (out) out.textContent = parts.length ? `Valve: ${parts.join(' • ')}` : 'Valve: no response';
+                await api('/api/valve/stop', { method: 'POST' });
+                if (valveStatus) valveStatus.textContent = 'Valve: STOP (relays off)';
             } catch (e) {
-                if (out) out.textContent = `Valve read error: ${e.message}`;
+                if (valveStatus) valveStatus.textContent = `Valve stop error: ${e.message}`;
             }
         });
     }
@@ -365,5 +460,24 @@ window.addEventListener('DOMContentLoaded', async () => {
     // Setup page can be slower.
     const needsFast = has('runStatus') || has('valveStatus');
     const pollMs = needsFast ? 500 : 1500;
-    setInterval(() => refreshStatus().catch(() => {}), pollMs);
+    let inFlight = false;
+    setInterval(() => {
+        if (inFlight) return;
+        inFlight = true;
+        refreshStatus().catch(() => {}).finally(() => { inFlight = false; });
+    }, pollMs);
+
+    // Connection watchdog: if we haven't had a successful /api/status in a while,
+    // mark disconnected.
+    setInterval(() => {
+        const dot = document.getElementById('connDot');
+        const txt = document.getElementById('connText');
+        if (!dot && !txt) return;
+        const last = window.__lastStatusOkAt || 0;
+        const age = Date.now() - last;
+        if (age > 2500) {
+            if (dot) dot.style.background = '#9aa0a6';
+            if (txt) txt.textContent = 'disconnected';
+        }
+    }, 500);
 });

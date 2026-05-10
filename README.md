@@ -70,7 +70,11 @@ This firmware controls a proportional valve over **RS485 Modbus-RTU**.
 - Wiring on ESP32-C3:
    - TX = **GPIO4**
    - RX = **GPIO5**
-   - DE/RE (TX enable) = **GPIO6**
+   - DE/RE (TX enable) = optional (only if your RS485 board exposes it)
+
+If your RS485 module/board has **no DE/RE pin** (often marked **NC**), set:
+
+- `RS485_DE_PIN = -1` in `src/main.ino`
 
 Implemented Modbus functions:
 

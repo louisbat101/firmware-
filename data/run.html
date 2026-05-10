@@ -13,7 +13,7 @@
             <div class="topbar">
                 <div>
                     <h1>Batch Run</h1>
-                    <p class="muted">Dispense by gallons • Sensor 1 (GPIO2) pulses • RS485 Modbus valve</p>
+                    <p class="muted">Dispense by gallons • Sensor 1 (GPIO2) pulses • Relay-driven valve</p>
                 </div>
                 <nav class="nav">
                     <a class="navlink" href="/setup.html">Setup</a>
@@ -24,7 +24,11 @@
         </header>
 
         <section class="card">
-            <h2>Batch Run</h2>
+            <h2 style="display:flex; align-items:center; gap:10px">
+                <span>Batch Run</span>
+                <span id="connDot" title="Connection" style="width:10px; height:10px; border-radius:50%; display:inline-block; background:#9aa0a6"></span>
+                <span id="connText" class="muted" style="font-size:13px">disconnected</span>
+            </h2>
             <div class="row">
                 <label>
                     Product
@@ -36,6 +40,7 @@
                 </label>
                 <button id="runStart" class="btn primary">Start</button>
                 <button id="runStop" class="btn danger">Stop</button>
+                <button id="runReset" class="btn">Reset</button>
             </div>
             <div class="row" style="align-items:center; gap:12px; margin-top:10px">
                 <div style="flex:1">
@@ -65,7 +70,7 @@
         </section>
 
         <section class="card">
-            <h2>Valve Control (RS485 Modbus)</h2>
+            <h2>Valve Control (Relays)</h2>
             <p class="muted">Quick test tools. 0 = open, 9000 = closed (degrees × 100).</p>
             <div class="row">
                 <button id="valveOpen" class="btn primary">Open</button>

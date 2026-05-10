@@ -5,7 +5,114 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ESP32-C3 Batch Flow – Diagnostics</title>
     <link rel="stylesheet" href="styles.css?v=2026-05-09-2">
-    <script src="app.js?v=2026-05-09-2" defer></script>
+    <script>
+        // Minimal JS for fast diagnostics load (avoid parsing the full app.js).
+        async function api(path, { method = 'GET', params, timeoutMs = 1500 } = {}) {
+            let url = path;
+            if (params) {
+                const qs = new URLSearchParams(params);
+                url += `?${qs.toString()}`;
+            }
+            const ac = new AbortController();
+            const t = setTimeout(() => ac.abort(), timeoutMs);
+            let res;
+            try {
+                res = await fetch(url, { method, signal: ac.signal });
+            } finally {
+                clearTimeout(t);
+            }
+            if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+            const ct = res.headers.get('content-type') || '';
+            if (ct.includes('application/json')) return res.json();
+            return res.text();
+        }
+
+        function el(id) { return document.getElementById(id); }
+
+        async function refreshDriveMs() {
+            try {
+                const cur = await api('/api/valve/drive_ms');
+                if (typeof cur.openMs === 'number') el('driveOpenMs').value = String(cur.openMs);
+                if (typeof cur.closeMs === 'number') el('driveCloseMs').value = String(cur.closeMs);
+            } catch {}
+        }
+
+        async function refreshStatus() {
+            try {
+                const st = await api('/api/status', { timeoutMs: 1200 });
+                const v = st.valve || {};
+                const parts = [];
+                if (typeof v.positionDeg100 === 'number') parts.push(`pos=${v.positionDeg100}`);
+                if (typeof v.error === 'number') parts.push(`err=${v.error}`);
+                if (typeof v.driveOpenMs === 'number') parts.push(`openMs=${v.driveOpenMs}`);
+                if (typeof v.driveCloseMs === 'number') parts.push(`closeMs=${v.driveCloseMs}`);
+                el('valveStatus').textContent = parts.length ? `Valve: ${parts.join(' • ')}` : 'Valve: (no status)';
+            } catch {
+                // Don't spam errors; AP Wi-Fi can be spotty.
+            }
+        }
+
+        window.addEventListener('DOMContentLoaded', async () => {
+            el('valveOpen').addEventListener('click', async () => {
+                el('valveStatus').textContent = 'Valve: OPEN…';
+                try { await api('/api/valve/set', { method: 'POST', params: { deg100: '0' }, timeoutMs: 1200 }); } catch (e) {}
+                refreshStatus();
+            });
+            el('valveClose').addEventListener('click', async () => {
+                el('valveStatus').textContent = 'Valve: CLOSE…';
+                try { await api('/api/valve/set', { method: 'POST', params: { deg100: '9000' }, timeoutMs: 1200 }); } catch (e) {}
+                refreshStatus();
+            });
+            el('valveStop').addEventListener('click', async () => {
+                el('valveStatus').textContent = 'Valve: STOP…';
+                try { await api('/api/valve/stop', { method: 'POST', timeoutMs: 1200 }); } catch (e) {}
+                refreshStatus();
+            });
+            el('driveSave').addEventListener('click', async () => {
+                const o = parseInt(el('driveOpenMs').value || '4000', 10);
+                const c = parseInt(el('driveCloseMs').value || '4000', 10);
+                el('valveStatus').textContent = `Saving… open=${o} close=${c}`;
+                try {
+                    await api('/api/valve/drive_ms', { method: 'POST', params: { openMs: String(o), closeMs: String(c) }, timeoutMs: 1500 });
+                    el('valveStatus').textContent = `Saved: open=${o}ms close=${c}ms`;
+                } catch (e) {
+                    el('valveStatus').textContent = `Save failed (will retry later)`;
+                }
+                refreshStatus();
+            });
+
+            // Raw IN1 debug helpers
+            el('in1High').addEventListener('click', async () => {
+                el('in1Status').textContent = 'GPIO7 -> HIGH…';
+                try { await api('/api/relay/test', { method: 'POST', params: { pin: '7', level: '1' }, timeoutMs: 1200 }); } catch {}
+            });
+            el('in1Low').addEventListener('click', async () => {
+                el('in1Status').textContent = 'GPIO7 -> LOW…';
+                try { await api('/api/relay/test', { method: 'POST', params: { pin: '7', level: '0' }, timeoutMs: 1200 }); } catch {}
+            });
+            el('polLow').addEventListener('click', async () => {
+                el('in1Status').textContent = 'Setting polarity: active LOW…';
+                try { await api('/api/relay/polarity', { method: 'POST', params: { activeLow: '1' }, timeoutMs: 1500 }); } catch {}
+            });
+            el('polHigh').addEventListener('click', async () => {
+                el('in1Status').textContent = 'Setting polarity: active HIGH…';
+                try { await api('/api/relay/polarity', { method: 'POST', params: { activeLow: '0' }, timeoutMs: 1500 }); } catch {}
+            });
+
+            // Best-effort quick init
+            refreshDriveMs();
+            refreshStatus();
+            setInterval(refreshStatus, 1500);
+
+            // UI version
+            try {
+                const v = await api('/api/version', { timeoutMs: 1200 });
+                el('uiVersion').textContent = `UI version: ${v.uiVersion || 'unknown'}`;
+            } catch {
+                el('uiVersion').textContent = '';
+            }
+        });
+    </script>
 </head>
 <body>
     <div class="wrap">
@@ -13,7 +120,7 @@
             <div class="topbar">
                 <div>
                     <h1>Diagnostics</h1>
-                    <p class="muted">RS485 / Modbus scan + quick health checks</p>
+                    <p class="muted">Relay valve test + quick health checks</p>
                 </div>
                 <nav class="nav">
                     <a class="navlink" href="/setup.html">Setup</a>
@@ -24,30 +131,42 @@
         </header>
 
         <section class="card">
-            <h2>RS485 scan</h2>
-            <p class="muted">This sends a small Modbus read to each address in the range. Devices that respond will appear below.</p>
+            <h2>Relay valve test</h2>
+            <p class="muted">This valve uses constant +12V on BROWN and a switched +12V on BLACK (relay enable). Use STOP anytime to cut power to BLACK.</p>
+
+            <div class="row">
+                <button id="valveOpen" class="btn primary">Open</button>
+                <button id="valveClose" class="btn danger">Close</button>
+                <button id="valveStop" class="btn">Stop</button>
+            </div>
+
             <div class="row">
                 <label>
-                    Start address
-                    <input id="rsStart" type="number" min="1" max="247" value="1" />
+                    Open drive (ms)
+                    <input id="driveOpenMs" type="number" min="50" max="10000" step="10" value="4000" />
                 </label>
                 <label>
-                    End address
-                    <input id="rsEnd" type="number" min="1" max="247" value="10" />
+                    Close drive (ms)
+                    <input id="driveCloseMs" type="number" min="50" max="10000" step="10" value="4000" />
                 </label>
-                <button id="rsScan" class="btn primary">Scan</button>
+                <button id="driveSave" class="btn">Save drive time</button>
             </div>
-            <div class="muted" id="rsStatus"></div>
-            <div id="rsFound" class="list"></div>
+
+            <div class="muted" id="valveStatus"></div>
         </section>
 
         <section class="card">
-            <h2>Valve quick check</h2>
-            <p class="muted">Reads valve position + error using the configured Modbus address.</p>
+            <h2>IN1 LED debug (raw GPIO7)</h2>
+            <p class="muted">These buttons bypass the valve logic and directly force GPIO7 HIGH/LOW. If IN1 LED never changes, the relay module input is not actually connected to GPIO7 (or the module input is hard-driven).</p>
             <div class="row">
-                <button id="diagValveRead" class="btn">Read valve status</button>
+                <button id="in1High" class="btn">GPIO7 HIGH</button>
+                <button id="in1Low" class="btn">GPIO7 LOW</button>
             </div>
-            <div class="muted" id="diagValveStatus"></div>
+            <div class="row">
+                <button id="polLow" class="btn">Polarity: active LOW</button>
+                <button id="polHigh" class="btn">Polarity: active HIGH</button>
+            </div>
+            <div class="muted" id="in1Status"></div>
         </section>
 
         <footer class="muted" style="margin:14px 4px" id="uiVersion">UI version: …</footer>
