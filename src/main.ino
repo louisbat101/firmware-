@@ -89,6 +89,36 @@ static void relayBootSafeInit() {
   initPin(RELAY_CLOSE_PIN);
 }
 
+// --- Serial debug helpers ---
+// Some failures happen before WiFi starts; we want a very early heartbeat.
+static const uint32_t SERIAL_BAUD = 115200;
+
+static void serialEarlyInit() {
+  // In USB-Serial/JTAG mode, Serial can take a moment. Keep it non-blocking.
+  Serial.begin(SERIAL_BAUD);
+  delay(50);
+  Serial.println();
+  Serial.println("[BOOT] ESP32C3-Keypad starting...");
+  Serial.printf("[BOOT] UI_VERSION=%s\n", UI_VERSION);
+}
+
+static void serialPeriodicWiFiStatus() {
+  static uint32_t last = 0;
+  const uint32_t now = nowMs();
+  if (now - last < 2000) return;
+  last = now;
+
+  // These prints are intentionally short and frequent.
+  Serial.printf(
+    "[WiFi] mode=%d status=%d AP=%d stations=%d ip=%s\n",
+    (int)WiFi.getMode(),
+    (int)WiFi.status(),
+    (int)WiFi.softAPgetStationNum() >= 0,
+    (int)WiFi.softAPgetStationNum(),
+    WiFi.softAPIP().toString().c_str()
+  );
+}
+
 // How long to energize a relay for an open/close command.
 // Your valve label shows ~3s; we default to 3500ms.
 // You reported ~4 seconds to fully open/close, so set default to 4000ms.
@@ -340,10 +370,7 @@ static void onWiFiEvent(WiFiEvent_t event) {
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(200);
-  Serial.println();
-  Serial.println("Booting ESP32-C3 keypad AP...");
+  serialEarlyInit();
   WiFi.onEvent(onWiFiEvent);
 
   // Relay boot safety: drive relay pins to INACTIVE as early as possible.
@@ -854,6 +881,9 @@ void setup() {
 
 void loop() {
   server.handleClient();
+
+  // Debug heartbeat: helps confirm WiFi/AP state even if the UI can't connect.
+  serialPeriodicWiFiStatus();
 
   // Relay valve auto-stop
   if (g_valveDriveUntilMs != 0 && (int32_t)(nowMs() - g_valveDriveUntilMs) >= 0) {
